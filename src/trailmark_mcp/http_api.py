@@ -31,9 +31,11 @@ _TOOL_EXCEPTIONS: tuple[type[BaseException], ...] = (
 
 
 def _tool_index() -> dict[str, Any]:
-    """Live view of every ``@mcp.tool()``-registered tool."""
-    return mcp._tool_manager._tools  # noqa: SLF001 — public surface of FastMCP
+    """Build a name->tool dict from FastMCP's local provider."""
+    import asyncio
 
+    tools = asyncio.run(mcp._local_provider.list_tools())
+    return {t.name: t for t in tools}
 
 def _make_handler(fn: Callable[..., Any], tool_name: str) -> Callable[..., Any]:
     """Build a FastAPI POST handler that proxies a single tool function."""
