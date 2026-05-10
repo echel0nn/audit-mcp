@@ -192,16 +192,18 @@ These are optional. Install whichever ones cover your stack. `list_scanners()` t
 
 You don't need all of them. You don't need any of them. The graph analysis works standalone. The scanners are just extra firepower when you want to go absolutely nuclear on a codebase.
 
-## Large Codebase Support (Yes, It Handles Chromium)
+## Large Codebase Support
 
-Most tools implode on anything bigger than a weekend project. This one was specifically designed to handle Chromium-scale codebases. 35 million lines of code. 350,000 files. The kind of thing that makes other tools curl up and die.
+Tested on projects up to ~10K files. The architecture is designed to scale further but hasn't been validated against truly massive codebases (Chromium, Linux kernel). If you point it at 350,000 files and it falls over, that's expected — open an issue and we'll fix what breaks. The plumbing is there, the battle scars aren't yet.
 
-- **Bounded queries** — every graph traversal has depth limits, result caps, pagination, and hub exclusion. `ancestors_of("main")` on the Linux kernel doesn't OOM your machine. It returns 100 results and says "49,900 more available, refine your query." Responsible behavior.
-- **Graph cache** — the merged graph gets serialized to msgpack. Warm re-index with no changes: under 30 seconds instead of 12 minutes. Content-hash based. If nothing changed, nothing recomputes.
-- **Lazy preanalysis** — blast radius is computed on demand, not eagerly for all 500,000 functions. Because computing transitive closure for half a million nodes on startup is psychotic behavior.
-- **Async heavy tools** — scanners and full-codebase analysis return a task ID. Poll for results. Don't block the server for 10 minutes waiting for semgrep to finish.
+What IS built and working:
+
+- **Bounded queries** — every graph traversal has depth limits, result caps, pagination, and hub exclusion. `ancestors_of("main")` won't OOM your machine. It returns 100 results and says "49,900 more available, refine your query." Responsible behavior.
+- **Graph cache** — the merged graph gets serialized to msgpack. Warm re-index with no file changes skips the expensive merge + preanalysis. Content-hash based.
+- **Lazy preanalysis** — blast radius is computed on demand, not eagerly for every function. Because computing transitive closure for your entire codebase on startup is psychotic behavior.
+- **Async heavy tools** — scanners and full-codebase analysis return a task ID. Poll for results. Don't block the server waiting for semgrep to finish.
 - **LRU eviction** — configurable engine budget. Load 8 codebases, evict the oldest when you load the 9th. Engines reload from disk when you need them again. Memory stays bounded.
-- **Partitioned indexing** — `plan_partitions()` splits a massive codebase into indexable chunks by directory. Each chunk indexes independently.
+- **Partitioned indexing** — `plan_partitions()` splits a big codebase into indexable chunks by directory. Each chunk indexes independently. Cross-partition queries are not yet wired.
 
 ## Environment Variables
 
