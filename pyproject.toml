@@ -14,6 +14,7 @@ dependencies = [
     "fastmcp>=0.4.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
+    "msgpack>=1.0.0",
 ]
 
 [project.optional-dependencies]

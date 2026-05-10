@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import msgpack
+
 __all__ = ["FastIndexer", "IndexProgress"]
 
 _log = logging.getLogger(__name__)
@@ -134,12 +136,12 @@ class FastIndexer:
         if language == "auto":
             langs = detect_languages(str(root))
         elif "," in language:
-            langs = [l.strip() for lang_name in language.split(",")]
+            langs = [lang_name.strip() for lang_name in language.split(",")]
         else:
             langs = [language]
 
         supported = set(supported_languages())
-        langs = [l for l in langs if l in supported]
+        langs = [lang for lang in langs if lang in supported]
         if not langs:
             raise ValueError(f"No supported languages detected in {root}")
 
@@ -154,6 +156,20 @@ class FastIndexer:
             "fast_index: %d files, %d languages, %d workers",
             len(source_files), len(langs), self._max_workers,
         )
+
+        # Composite content hash → graph cache fast path
+        composite_hash = self._composite_hash(source_files, root)
+        cached_engine = self._load_cached_graph(composite_hash, root)
+        if cached_engine is not None:
+            elapsed = time.monotonic() - t0
+            if progress is not None:
+                progress.cached_files = len(source_files)
+                progress.elapsed_seconds = elapsed
+            _log.info(
+                "fast_index: graph cache hit for %s in %.2fs (%d files)",
+                composite_hash[:12], elapsed, len(source_files),
+            )
+            return cached_engine
 
         # Parallel parse with caching
         parse_results = self._parallel_parse(source_files, progress)
@@ -177,6 +193,7 @@ class FastIndexer:
             run_preanalysis(store)
 
         engine = QueryEngine.from_graph(merged)
+        self._save_cached_graph(composite_hash, engine)
 
         elapsed = time.monotonic() - t0
         if progress is not None:
@@ -190,6 +207,63 @@ class FastIndexer:
             progress.failed_files if progress else "?",
         )
         return engine
+
+    def _composite_hash(
+        self, files: list[tuple[str, str]], root: Path,
+    ) -> str:
+        """SHA256 over (relative_path, content_hash) pairs sorted by path."""
+        pairs: list[tuple[str, str]] = []
+        for fpath, _lang in files:
+            try:
+                rel = str(Path(fpath).resolve().relative_to(root)).replace("\\", "/")
+            except ValueError:
+                rel = fpath
+            pairs.append((rel, self._hash_file(fpath)))
+        pairs.sort(key=lambda p: p[0])
+        h = hashlib.sha256()
+        for rel, content_hash in pairs:
+            h.update(f"{rel}:{content_hash}".encode())
+        return h.hexdigest()
+
+    def _graph_cache_path(self, composite_hash: str) -> Path:
+        return self._cache_dir / "graphs" / f"{composite_hash}.msgpack"
+
+    def _load_cached_graph(
+        self, composite_hash: str, root: Path,
+    ) -> Any | None:
+        """Try to load a cached QueryEngine for this composite hash."""
+        path = self._graph_cache_path(composite_hash)
+        if not path.exists():
+            return None
+        try:
+            from trailmark.analysis.entrypoints import detect_entrypoints
+            from trailmark.models.graph import CodeGraph
+            from trailmark.query.api import QueryEngine
+
+            data = msgpack.unpackb(path.read_bytes(), raw=False)
+            graph = CodeGraph.from_dict(data)
+            graph.entrypoints.update(detect_entrypoints(graph, str(root)))
+            return QueryEngine.from_graph(graph)
+        except (OSError, KeyError, ValueError, TypeError, ImportError) as exc:
+            _log.debug(
+                "graph cache load failed for %s: %s",
+                composite_hash[:12], exc,
+            )
+            return None
+
+    def _save_cached_graph(self, composite_hash: str, engine: Any) -> None:
+        """Persist the engine's graph under the composite hash key."""
+        path = self._graph_cache_path(composite_hash)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            graph_data = engine.to_json()
+            packed = msgpack.packb(graph_data, use_bin_type=True, default=str)
+            path.write_bytes(packed)
+        except (OSError, TypeError, ValueError) as exc:
+            _log.debug(
+                "graph cache write failed for %s: %s",
+                composite_hash[:12], exc,
+            )
 
     def _parallel_parse(
         self,
@@ -353,29 +427,46 @@ class FastIndexer:
         return files
 
     def clear_cache(self) -> int:
-        """Remove all cached parse results. Returns count of files removed."""
+        """Remove all cached parse results and graph caches. Returns count removed."""
         count = 0
         if self._cache_dir.exists():
-            for f in self._cache_dir.rglob("*.json"):
-                f.unlink(missing_ok=True)
-                count += 1
-            # Clean empty shard directories
-            for d in sorted(self._cache_dir.iterdir(), reverse=True):
-                if d.is_dir():
-                    try:
-                        d.rmdir()
-                    except OSError:
-                        pass
+            for pattern in ("*.json", "*.msgpack"):
+                for f in self._cache_dir.rglob(pattern):
+                    f.unlink(missing_ok=True)
+                    count += 1
+            # Clean empty shard directories (deepest first)
+            for d in sorted(
+                (p for p in self._cache_dir.rglob("*") if p.is_dir()),
+                key=lambda p: len(p.parts), reverse=True,
+            ):
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
         return count
 
     def cache_stats(self) -> dict[str, Any]:
-        """Return cache size and entry count."""
+        """Return cache size and entry count for parse + graph caches."""
         if not self._cache_dir.exists():
-            return {"entries": 0, "size_bytes": 0, "path": str(self._cache_dir)}
-        entries = list(self._cache_dir.rglob("*.json"))
-        total_size = sum(f.stat().st_size for f in entries)
+            return {
+                "entries": 0,
+                "graph_entries": 0,
+                "size_bytes": 0,
+                "path": str(self._cache_dir),
+            }
+        graph_dir = self._cache_dir / "graphs"
+        parse_entries = [
+            f for f in self._cache_dir.rglob("*.json")
+            if graph_dir not in f.parents
+        ]
+        graph_entries = (
+            list(graph_dir.rglob("*.msgpack")) if graph_dir.exists() else []
+        )
+        all_entries = parse_entries + graph_entries
+        total_size = sum(f.stat().st_size for f in all_entries)
         return {
-            "entries": len(entries),
+            "entries": len(parse_entries),
+            "graph_entries": len(graph_entries),
             "size_bytes": total_size,
             "size_mb": round(total_size / (1024 * 1024), 2),
             "path": str(self._cache_dir),

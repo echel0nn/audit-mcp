@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -41,14 +42,26 @@ class IndexManager:
     ``start_index`` returns immediately with a stable ``index_id``; the parse
     and pre-analysis run on a daemon thread. Ready indexes are persisted to disk
     via ``DurableIndexStore`` and survive process restarts.
+
+    Engine lifecycle is memory-bounded: when more than ``max_loaded_engines``
+    engines are resident, the least-recently-used engine is evicted (set to
+    None). Evicted engines reload from disk on next ``get_engine`` call.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_loaded_engines: int | None = None,
+    ) -> None:
         from audit_mcp.store import DurableIndexStore
 
         self._lock = threading.Lock()
         self._indexes: dict[str, IndexEntry] = {}
         self._store = DurableIndexStore()
+        self._access_order: list[str] = []  # LRU: oldest first
+        self._max_loaded = max_loaded_engines or int(
+            os.environ.get("AUDIT_MCP_MAX_ENGINES", "8")
+        )
+        self._eviction_count: int = 0
         self._recover_from_store()
 
     def start_index(self, path: str, language: str = "auto") -> str:
@@ -108,12 +121,31 @@ class IndexManager:
         return result
 
     def get_engine(self, index_id: str) -> Any:
-        """Return the QueryEngine if ready, else ``None``."""
+        """Return the QueryEngine if ready, else ``None``.
+
+        Marks the index as most-recently-used. May evict the LRU engine
+        if the loaded engine count exceeds the budget.
+        """
         with self._lock:
             entry = self._indexes.get(index_id)
             if entry is None or entry.status != "ready":
                 return None
-            return entry.engine
+            if entry.engine is not None:
+                self._touch_locked(index_id)
+                self._maybe_evict_locked()
+                return entry.engine
+
+        # Engine is None (evicted or recovered from store without engine).
+        # Try loading from disk outside the lock (I/O heavy).
+        engine = self._store.get_engine(index_id)
+        if engine is not None:
+            with self._lock:
+                entry_again = self._indexes.get(index_id)
+                if entry_again is not None:
+                    entry_again.engine = engine
+                    self._touch_locked(index_id)
+                    self._maybe_evict_locked()
+        return engine
 
     def list_indexes(self) -> list[dict[str, Any]]:
         """Return a snapshot of every index entry."""
@@ -194,3 +226,48 @@ class IndexManager:
             return False
         self._store.close_index(index_id)
         return True
+
+    # ------------------------------------------------------------------
+    # LRU engine management
+    # ------------------------------------------------------------------
+
+    def _touch_locked(self, index_id: str) -> None:
+        """Move *index_id* to most-recently-used (must hold _lock)."""
+        try:
+            self._access_order.remove(index_id)
+        except ValueError:
+            pass
+        self._access_order.append(index_id)
+
+    def _maybe_evict_locked(self) -> None:
+        """Evict LRU engines until loaded count <= budget (must hold _lock)."""
+        loaded = [
+            iid for iid, e in self._indexes.items()
+            if e.engine is not None
+        ]
+        while len(loaded) > self._max_loaded and self._access_order:
+            victim_id = self._access_order.pop(0)
+            victim = self._indexes.get(victim_id)
+            if victim is not None and victim.engine is not None:
+                _log.info(
+                    "evicting engine %s (loaded=%d, budget=%d)",
+                    victim_id, len(loaded), self._max_loaded,
+                )
+                victim.engine = None
+                self._eviction_count += 1
+                loaded = [
+                    iid for iid, e in self._indexes.items()
+                    if e.engine is not None
+                ]
+
+    def memory_stats(self) -> dict[str, Any]:
+        """Return engine loading stats for the memory_usage tool."""
+        with self._lock:
+            loaded = sum(1 for e in self._indexes.values() if e.engine is not None)
+            total = len(self._indexes)
+        return {
+            "loaded_engines": loaded,
+            "total_indexes": total,
+            "max_loaded_engines": self._max_loaded,
+            "eviction_count": self._eviction_count,
+        }

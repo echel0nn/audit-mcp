@@ -5,25 +5,43 @@ requires an ``index_id`` returned by :func:`index_codebase`; until that index
 reports ``status == "ready"`` the tool returns ``{"status": "pending", ...}``
 so callers can poll without blocking.
 
+Performance-optimised for large codebases (Chromium, Linux kernel, Android):
+- All graph queries are bounded (depth, limit, offset, hub exclusion)
+- Preanalysis is lazy (blast radius computed on demand, not eagerly)
+- Heavy tools (dead_code, scanners) run async with poll-for-result
+- export_graph is capped for large graphs
+
 The same ``mcp`` and ``index_manager`` singletons are shared with the HTTP
 transport so callers see one cache across both.
 """
 from __future__ import annotations
 
 import logging
-import re
+from functools import partial
 from typing import Any
 
 from fastmcp import FastMCP
 
 from audit_mcp.indexer import IndexManager
+from audit_mcp.query_bounds import (
+    BoundedResult,
+    QueryBounds,
+    bounded_ancestors,
+    bounded_callees,
+    bounded_callers,
+    bounded_paths,
+    bounded_reachable,
+    bounded_search,
+)
+from audit_mcp.tasks import TaskRunner
 
-__all__ = ["mcp", "run_mcp", "index_manager"]
+__all__ = ["mcp", "run_mcp", "index_manager", "task_runner"]
 
 _log = logging.getLogger(__name__)
 
 mcp = FastMCP("audit-mcp")
 index_manager = IndexManager()
+task_runner = TaskRunner()
 
 
 # Errors that map to a JSON envelope rather than crashing the tool transport.
@@ -69,6 +87,17 @@ def _annotation_kind(kind: str) -> Any:
         raise ValueError(f"Unknown annotation kind {kind!r}; valid: {valid}") from exc
 
 
+def _bounded_envelope(result: BoundedResult, key: str) -> dict[str, Any]:
+    """Turn a BoundedResult into a standard tool response envelope."""
+    return {
+        key: result.results,
+        "total": result.total,
+        "returned": result.returned,
+        "truncated": result.truncated,
+        "truncation_hint": result.truncation_hint,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Index lifecycle
 # ---------------------------------------------------------------------------
@@ -100,7 +129,7 @@ def list_indexes() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Graph queries
+# Graph queries — ALL bounded (depth, limit, offset, hub exclusion)
 # ---------------------------------------------------------------------------
 
 
@@ -115,56 +144,116 @@ def summary(index_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def preanalysis(index_id: str) -> dict[str, Any]:
-    """Return blast radius, entrypoints, privilege boundaries, and taint passes."""
+    """Return entrypoints, blast radius top-50, and privilege boundaries.
+
+    Blast radius is computed lazily — first call may take a few seconds
+    while the top-50 functions are analyzed.
+    """
+    from audit_mcp.lazy_preanalysis import LazyPreanalysis
+
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    return engine.preanalysis()
+    lazy = LazyPreanalysis(engine)
+    return lazy.full_preanalysis()
 
 
 @mcp.tool()
-def callers_of(index_id: str, name: str) -> dict[str, Any]:
-    """Return direct callers of ``name``."""
+def callers_of(
+    index_id: str,
+    name: str,
+    limit: int = 100,
+    offset: int = 0,
+    exclude_hubs: bool = True,
+) -> dict[str, Any]:
+    """Return direct callers of ``name``.
+
+    High-in-degree functions (logging, utility) are excluded by default.
+    Set ``exclude_hubs=False`` to include all callers."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    return {"callers": engine.callers_of(name)}
+    bounds = QueryBounds(limit=limit, offset=offset, exclude_hubs=exclude_hubs)
+    result = bounded_callers(engine, name, bounds)
+    return _bounded_envelope(result, "callers")
 
 
 @mcp.tool()
-def callees_of(index_id: str, name: str) -> dict[str, Any]:
+def callees_of(
+    index_id: str,
+    name: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
     """Return direct callees of ``name``."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    return {"callees": engine.callees_of(name)}
+    bounds = QueryBounds(limit=limit, offset=offset, exclude_hubs=False)
+    result = bounded_callees(engine, name, bounds)
+    return _bounded_envelope(result, "callees")
 
 
 @mcp.tool()
-def ancestors_of(index_id: str, name: str) -> dict[str, Any]:
-    """Return every function/method that can transitively reach ``name``."""
+def ancestors_of(
+    index_id: str,
+    name: str,
+    depth: int = 5,
+    limit: int = 100,
+    offset: int = 0,
+    exclude_hubs: bool = True,
+) -> dict[str, Any]:
+    """Return functions that can transitively reach ``name``.
+
+    Bounded by ``depth`` (max 20) and ``limit`` (max 5000).
+    Hub functions (in-degree > 100) are excluded by default."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    return {"ancestors": engine.ancestors_of(name)}
+    bounds = QueryBounds(depth=depth, limit=limit, offset=offset, exclude_hubs=exclude_hubs)
+    result = bounded_ancestors(engine, name, bounds)
+    return _bounded_envelope(result, "ancestors")
 
 
 @mcp.tool()
-def reachable_from(index_id: str, name: str) -> dict[str, Any]:
-    """Return every function/method transitively reachable from ``name``."""
+def reachable_from(
+    index_id: str,
+    name: str,
+    depth: int = 5,
+    limit: int = 100,
+    offset: int = 0,
+    exclude_hubs: bool = True,
+) -> dict[str, Any]:
+    """Return functions transitively reachable from ``name``.
+
+    Bounded by ``depth`` (max 20) and ``limit`` (max 5000).
+    Hub functions (in-degree > 100) are excluded by default."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    return {"reachable": engine.reachable_from(name)}
+    bounds = QueryBounds(depth=depth, limit=limit, offset=offset, exclude_hubs=exclude_hubs)
+    result = bounded_reachable(engine, name, bounds)
+    return _bounded_envelope(result, "reachable")
 
 
 @mcp.tool()
-def paths_between(index_id: str, source: str, target: str) -> dict[str, Any]:
-    """Return all call paths from ``source`` to ``target``."""
+def paths_between(
+    index_id: str,
+    source: str,
+    target: str,
+    depth: int = 10,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Return call paths from ``source`` to ``target``.
+
+    Returns at most ``limit`` shortest paths (default 5, max 5000).
+    ``depth`` caps the max path length (default 10, max 20)."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    return {"paths": engine.paths_between(source, target)}
+    bounds = QueryBounds(depth=depth, limit=limit)
+    result = bounded_paths(engine, source, target, bounds, max_paths=limit)
+    return _bounded_envelope(result, "paths")
 
 
 @mcp.tool()
@@ -172,13 +261,24 @@ def entrypoint_paths_to(
     index_id: str,
     name: str,
     max_depth: int = 20,
+    limit: int = 10,
 ) -> dict[str, Any]:
-    """Return call paths from any entrypoint to ``name``."""
+    """Return call paths from any entrypoint to ``name``.
+
+    Returns at most ``limit`` paths (default 10)."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
+    raw_paths = engine.entrypoint_paths_to(name, max_depth=max_depth)
+    total = len(raw_paths) if isinstance(raw_paths, list) else 0
+    capped = raw_paths[:limit] if isinstance(raw_paths, list) else raw_paths
+    truncated = total > limit
     return {
-        "paths": engine.entrypoint_paths_to(name, max_depth=max_depth),
+        "paths": capped,
+        "total": total,
+        "returned": len(capped) if isinstance(capped, list) else 0,
+        "truncated": truncated,
+        "truncation_hint": f"Showing {limit} of {total} paths. Increase limit to see more." if truncated else "",
     }
 
 
@@ -192,45 +292,45 @@ def attack_surface(index_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def complexity_hotspots(index_id: str, threshold: int = 10) -> dict[str, Any]:
-    """Return functions with cyclomatic complexity >= ``threshold``."""
+def complexity_hotspots(
+    index_id: str,
+    threshold: int = 10,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Return functions with cyclomatic complexity >= ``threshold``.
+
+    Results are paginated. Blast radius is computed lazily per function."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    return {"hotspots": engine.complexity_hotspots(threshold=threshold)}
+    all_hotspots = engine.complexity_hotspots(threshold=threshold)
+    total = len(all_hotspots) if isinstance(all_hotspots, list) else 0
+    page = all_hotspots[offset:offset + limit] if isinstance(all_hotspots, list) else all_hotspots
+    return {
+        "hotspots": page,
+        "total": total,
+        "returned": len(page) if isinstance(page, list) else 0,
+        "truncated": total > offset + limit,
+    }
 
 
 @mcp.tool()
-def search_functions(index_id: str, pattern: str) -> dict[str, Any]:
-    """Regex-search function/method names in the graph (case-insensitive)."""
+def search_functions(
+    index_id: str,
+    pattern: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Regex-search function/method names in the graph (case-insensitive).
+
+    Results are paginated via ``limit`` and ``offset``."""
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error as exc:
-        return {"status": "error", "error": f"Invalid regex: {exc}"}
-    graph = engine._store._graph  # noqa: SLF001 — trailmark public-by-convention
-    matches: list[dict[str, Any]] = []
-    for unit in graph.nodes.values():
-        kind_value = getattr(unit.kind, "value", str(unit.kind))
-        if kind_value not in {"function", "method"}:
-            continue
-        name = getattr(unit, "name", "") or ""
-        qualified = getattr(unit, "qualified_name", "") or ""
-        if regex.search(name) or regex.search(qualified):
-            matches.append(
-                {
-                    "id": getattr(unit, "id", None),
-                    "name": name,
-                    "qualified_name": qualified,
-                    "file_path": getattr(unit, "file_path", ""),
-                    "line_start": getattr(unit, "line_start", 0),
-                    "line_end": getattr(unit, "line_end", 0),
-                    "kind": kind_value,
-                }
-            )
-    return {"matches": matches, "count": len(matches)}
+    bounds = QueryBounds(limit=limit, offset=offset)
+    result = bounded_search(engine, pattern, bounds)
+    return _bounded_envelope(result, "matches")
 
 
 @mcp.tool()
@@ -313,38 +413,24 @@ def list_scanners() -> dict[str, Any]:
     return {"scanners": ScannerRunner.list_installed()}
 
 
-@mcp.tool()
-def run_scanner(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict[str, Any]:
-    """Execute a SAST scanner on an indexed codebase and import results.
-
-    Runs the scanner, produces SARIF, imports findings into the code graph.
-    Returns a summary of findings found.
-
-    Supported scanners: semgrep, bandit, trivy, bearer, gosec, phpstan.
-    """
+def _run_scanner_sync(
+    index_id: str, scanner: str, timeout_seconds: int,
+) -> dict[str, Any]:
+    """Synchronous scanner execution — runs in a background thread."""
     from audit_mcp.scanners import ScannerRunner
 
-    engine, err = _require_engine(index_id)
-    if err:
-        return err
+    engine = index_manager.get_engine(index_id)
+    if engine is None:
+        return {"status": "error", "error": f"Engine not available for {index_id}"}
     entry = index_manager._indexes.get(index_id)  # noqa: SLF001
     if entry is None:
         return {"status": "error", "error": f"Index {index_id!r} not found"}
-
-    try:
-        sarif_path = ScannerRunner.run(scanner, entry.root_path, timeout_seconds)
-    except (ValueError, RuntimeError, OSError) as exc:
-        return {"status": "error", "error": str(exc)}
-
-    # Import SARIF results into the graph
+    sarif_path = ScannerRunner.run(scanner, entry.root_path, timeout_seconds)
     import_result = engine.augment_sarif(str(sarif_path))
-
-    # Clean up temp file
     try:
         sarif_path.unlink(missing_ok=True)
     except OSError:
         pass
-
     return {
         "status": "ready",
         "scanner": scanner,
@@ -353,39 +439,24 @@ def run_scanner(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict
     }
 
 
-@mcp.tool()
-def scan_and_correlate(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict[str, Any]:
-    """Run a scanner, import results, and correlate with graph properties.
-
-    The killer query: 'semgrep found 47 SQLi. Of those, 12 are tainted
-    from entrypoints. Of those, 3 have blast radius > 50. Start there.'
-
-    Returns findings sorted by risk_score (tainted + entrypoint-reachable
-    + high blast radius = highest priority).
-    """
+def _scan_and_correlate_sync(
+    index_id: str, scanner: str, timeout_seconds: int,
+) -> dict[str, Any]:
+    """Synchronous scan + correlate — runs in a background thread."""
     from audit_mcp.scanners import ScannerRunner
 
-    engine, err = _require_engine(index_id)
-    if err:
-        return err
+    engine = index_manager.get_engine(index_id)
+    if engine is None:
+        return {"status": "error", "error": f"Engine not available for {index_id}"}
     entry = index_manager._indexes.get(index_id)  # noqa: SLF001
     if entry is None:
         return {"status": "error", "error": f"Index {index_id!r} not found"}
-
-    # Step 1: Run the scanner
-    try:
-        sarif_path = ScannerRunner.run(scanner, entry.root_path, timeout_seconds)
-    except (ValueError, RuntimeError, OSError) as exc:
-        return {"status": "error", "error": str(exc)}
-
-    # Step 2: Import SARIF into graph
+    sarif_path = ScannerRunner.run(scanner, entry.root_path, timeout_seconds)
     engine.augment_sarif(str(sarif_path))
     try:
         sarif_path.unlink(missing_ok=True)
     except OSError:
         pass
-
-    # Step 3: Correlate findings with graph properties
     correlation = ScannerRunner.correlate_findings(engine, entry.preanalysis)
     return {
         "status": "ready",
@@ -393,6 +464,43 @@ def scan_and_correlate(index_id: str, scanner: str, timeout_seconds: int = 600) 
         "target": entry.root_path,
         **correlation,
     }
+
+
+@mcp.tool()
+def run_scanner(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict[str, Any]:
+    """Execute a SAST scanner on an indexed codebase (async).
+
+    Returns a ``task_id`` immediately. Poll with :func:`poll_task`.
+    Supported scanners: semgrep, bandit, trivy, bearer, gosec, phpstan.
+    """
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    task_id = task_runner.submit(
+        kind="run_scanner",
+        index_id=index_id,
+        fn=partial(_run_scanner_sync, index_id, scanner, timeout_seconds),
+    )
+    return {"task_id": task_id, "status": "running", "kind": "run_scanner"}
+
+
+@mcp.tool()
+def scan_and_correlate(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict[str, Any]:
+    """Run a scanner, import results, and correlate with graph properties (async).
+
+    Returns a ``task_id`` immediately. Poll with :func:`poll_task`.
+    The killer query: 'semgrep found 47 SQLi. Of those, 12 are tainted
+    from entrypoints. Of those, 3 have blast radius > 50. Start there.'
+    """
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    task_id = task_runner.submit(
+        kind="scan_and_correlate",
+        index_id=index_id,
+        fn=partial(_scan_and_correlate_sync, index_id, scanner, timeout_seconds),
+    )
+    return {"task_id": task_id, "status": "running", "kind": "scan_and_correlate"}
 
 
 # ---------------------------------------------------------------------------
@@ -451,11 +559,28 @@ def clear_annotations(index_id: str, name: str, kind: str | None = None) -> dict
 
 
 @mcp.tool()
-def export_graph(index_id: str) -> dict[str, Any]:
-    """Export the full code graph as JSON. Use for offline analysis or caching."""
+def export_graph(index_id: str, max_nodes: int = 10000) -> dict[str, Any]:
+    """Export the code graph as JSON.
+
+    Refuses graphs with more than ``max_nodes`` nodes to prevent
+    multi-gigabyte responses. Use ``plan_partitions`` to split large
+    codebases and export per-partition.
+    """
     engine, err = _require_engine(index_id)
     if err:
         return err
+    s = engine.summary()
+    node_count = s.get("functions", 0) + s.get("classes", 0) + s.get("nodes", 0)
+    if node_count > max_nodes:
+        return {
+            "status": "error",
+            "error": (
+                f"Graph has {node_count} nodes (cap: {max_nodes}). "
+                "Use plan_partitions to split, or increase max_nodes."
+            ),
+            "node_count": node_count,
+            "max_nodes": max_nodes,
+        }
     return engine.to_json()
 
 
@@ -481,36 +606,61 @@ def detect_languages(path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Deep audit tools (graph-aware, our differentiator)
+# Deep audit tools — async (return task_id, poll with poll_task)
 # ---------------------------------------------------------------------------
+
+
+def _dead_code_sync(index_id: str) -> dict[str, Any]:
+    from audit_mcp.deep_audit import find_dead_code
+
+    engine = index_manager.get_engine(index_id)
+    if engine is None:
+        return {"status": "error", "error": f"Engine not available for {index_id}"}
+    return find_dead_code(engine)
+
+
+def _unreachable_sync(index_id: str) -> dict[str, Any]:
+    from audit_mcp.deep_audit import find_unreachable_from_entrypoints
+
+    engine = index_manager.get_engine(index_id)
+    if engine is None:
+        return {"status": "error", "error": f"Engine not available for {index_id}"}
+    return find_unreachable_from_entrypoints(engine)
 
 
 @mcp.tool()
 def dead_code(index_id: str) -> dict[str, Any]:
-    """Find functions with zero callers that are not entrypoints.
+    """Find functions with zero callers that are not entrypoints (async).
 
+    Returns a ``task_id`` immediately. Poll with :func:`poll_task`.
     Dead code = never called. Removing it reduces attack surface.
-    Sorted by complexity (most complex dead code first)."""
-    from audit_mcp.deep_audit import find_dead_code
-
+    """
     engine, err = _require_engine(index_id)
     if err:
         return err
-    return find_dead_code(engine)
+    task_id = task_runner.submit(
+        kind="dead_code", index_id=index_id,
+        fn=partial(_dead_code_sync, index_id),
+    )
+    return {"task_id": task_id, "status": "running", "kind": "dead_code"}
 
 
 @mcp.tool()
 def unreachable_from_entrypoints(index_id: str) -> dict[str, Any]:
-    """Find functions no external entrypoint can transitively reach.
+    """Find functions no external entrypoint can transitively reach (async).
 
+    Returns a ``task_id`` immediately. Poll with :func:`poll_task`.
     Any SAST finding in these functions is lower priority — not exploitable
-    by external attackers (unless dynamic dispatch bypasses static analysis)."""
-    from audit_mcp.deep_audit import find_unreachable_from_entrypoints
-
+    by external attackers (unless dynamic dispatch bypasses static analysis).
+    """
     engine, err = _require_engine(index_id)
     if err:
         return err
-    return find_unreachable_from_entrypoints(engine)
+    task_id = task_runner.submit(
+        kind="unreachable", index_id=index_id,
+        fn=partial(_unreachable_sync, index_id),
+    )
+    return {"task_id": task_id, "status": "running", "kind": "unreachable"}
 
 
 @mcp.tool()
@@ -601,6 +751,28 @@ def plan_partitions(path: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Task polling (for async tools: dead_code, scanners, unreachable)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def poll_task(task_id: str) -> dict[str, Any]:
+    """Poll the status of an async task. Returns result when completed."""
+    return task_runner.poll(task_id)
+
+
+@mcp.tool()
+def list_tasks() -> dict[str, Any]:
+    """Return all background tasks and their current status."""
+    return {"tasks": task_runner.list_tasks()}
+
+
+# ---------------------------------------------------------------------------
+# Cache management
+# ---------------------------------------------------------------------------
+
+
 @mcp.tool()
 def cache_stats() -> dict[str, Any]:
     """Return parse cache size and entry count.
@@ -619,6 +791,17 @@ def clear_cache() -> dict[str, Any]:
 
     count = FastIndexer().clear_cache()
     return {"status": "ok", "cleared_entries": count}
+
+
+@mcp.tool()
+def memory_usage() -> dict[str, Any]:
+    """Return engine memory stats: loaded engines, eviction count, budget.
+
+    Use to monitor memory pressure when working with multiple large codebases.
+    Engines are evicted LRU-style when the loaded count exceeds the budget
+    (default 8, configurable via ``AUDIT_MCP_MAX_ENGINES`` env var).
+    """
+    return index_manager.memory_stats()
 
 
 def run_mcp() -> None:
