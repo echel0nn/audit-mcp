@@ -27,13 +27,12 @@ import hashlib
 import json
 import logging
 import os
+import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-import msgpack
 
 __all__ = ["FastIndexer", "IndexProgress"]
 
@@ -46,9 +45,10 @@ _CACHE_DIR = Path(
     )
 )
 
-# Max workers for parallel parsing. tree-sitter is GIL-free C code,
-# so threads give real parallelism here.
-_DEFAULT_WORKERS = min(os.cpu_count() or 4, 16)
+# tree-sitter's native Parser is !Send in Rust — it panics when dropped
+# on a different thread. Serial parsing avoids the issue; tree-sitter is
+# fast enough single-threaded (~10ms/file) that the bottleneck is merge.
+_DEFAULT_WORKERS = 1
 
 
 @dataclass
@@ -226,7 +226,7 @@ class FastIndexer:
         return h.hexdigest()
 
     def _graph_cache_path(self, composite_hash: str) -> Path:
-        return self._cache_dir / "graphs" / f"{composite_hash}.msgpack"
+        return self._cache_dir / "graphs" / f"{composite_hash}.pkl"
 
     def _load_cached_graph(
         self, composite_hash: str, root: Path,
@@ -237,14 +237,14 @@ class FastIndexer:
             return None
         try:
             from trailmark.analysis.entrypoints import detect_entrypoints
-            from trailmark.models.graph import CodeGraph
             from trailmark.query.api import QueryEngine
 
-            data = msgpack.unpackb(path.read_bytes(), raw=False)
-            graph = CodeGraph.from_dict(data)
+            with path.open("rb") as fh:
+                graph = pickle.load(fh)  # noqa: S301 — trusted local cache
             graph.entrypoints.update(detect_entrypoints(graph, str(root)))
             return QueryEngine.from_graph(graph)
-        except (OSError, KeyError, ValueError, TypeError, ImportError) as exc:
+        except (OSError, pickle.UnpicklingError, KeyError, ValueError,
+                TypeError, ImportError, AttributeError, ModuleNotFoundError) as exc:
             _log.debug(
                 "graph cache load failed for %s: %s",
                 composite_hash[:12], exc,
@@ -256,10 +256,9 @@ class FastIndexer:
         path = self._graph_cache_path(composite_hash)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            graph_data = engine.to_json()
-            packed = msgpack.packb(graph_data, use_bin_type=True, default=str)
-            path.write_bytes(packed)
-        except (OSError, TypeError, ValueError) as exc:
+            with path.open("wb") as fh:
+                pickle.dump(engine._store._graph, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        except (OSError, pickle.PicklingError, TypeError, AttributeError) as exc:
             _log.debug(
                 "graph cache write failed for %s: %s",
                 composite_hash[:12], exc,

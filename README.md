@@ -194,16 +194,29 @@ You don't need all of them. You don't need any of them. The graph analysis works
 
 ## Large Codebase Support
 
-Tested on projects up to ~10K files. The architecture is designed to scale further but hasn't been validated against truly massive codebases (Chromium, Linux kernel). If you point it at 350,000 files and it falls over, that's expected — open an issue and we'll fix what breaks. The plumbing is there, the battle scars aren't yet.
+Tested against real codebases. These are actual benchmark numbers, not estimates:
 
-What IS built and working:
+| Project | Files | Functions | Call Edges | Cold Index | Warm Re-index | Search | Hub Detect | Memory |
+|---|---|---|---|---|---|---|---|---|
+| **nginx** | 405 | 3,183 | 22,820 | 4.1s | 290ms | 3ms | 7ms | 114 MB |
+| **redis** | 570 | 10,350 | 75,981 | 8.1s | 640ms | 7ms | 21ms | 281 MB |
+| **curl** | 495 | 5,151 | 40,487 | 7.5s | 580ms | 4ms | 12ms | 269 MB |
+| **CPython** | 2,157 | 82,327 | 564,225 | 47s | 3.8s | 69ms | 166ms | 1.6 GB |
+| **Chromium** (base+net+url+crypto) | 5,974 | 29,015 | 417,256 | 50s | 3.5s | 24ms | 104ms | 1.5 GB |
+
+Cold index = first-ever parse. Warm re-index = no files changed, loads from graph cache. Search = `search_functions("parse")`. Hub detect = build in-degree index from all edges. Memory = RSS after full index + queries.
+
+What makes this work:
 
 - **Bounded queries** — every graph traversal has depth limits, result caps, pagination, and hub exclusion. `ancestors_of("main")` won't OOM your machine. It returns 100 results and says "49,900 more available, refine your query." Responsible behavior.
-- **Graph cache** — the merged graph gets serialized to msgpack. Warm re-index with no file changes skips the expensive merge + preanalysis. Content-hash based.
+- **Graph cache** — the merged graph gets pickled to disk. Warm re-index with no file changes: 290ms for nginx, 3.5s for Chromium. Content-hash based — if nothing changed, nothing recomputes.
 - **Lazy preanalysis** — blast radius is computed on demand, not eagerly for every function. Because computing transitive closure for your entire codebase on startup is psychotic behavior.
+- **O(E) hub detection** — builds an in-degree map from the edge list in one pass. 104ms on Chromium's 417K edges. The previous version called `callers_of()` per function and took 82 seconds on the same graph.
 - **Async heavy tools** — scanners and full-codebase analysis return a task ID. Poll for results. Don't block the server waiting for semgrep to finish.
 - **LRU eviction** — configurable engine budget. Load 8 codebases, evict the oldest when you load the 9th. Engines reload from disk when you need them again. Memory stays bounded.
 - **Partitioned indexing** — `plan_partitions()` splits a big codebase into indexable chunks by directory. Each chunk indexes independently. Cross-partition queries are not yet wired.
+
+**What hasn't been tested:** full Chromium checkout (350K files). The sparse checkout above covers base/, net/, url/, crypto/ — 6K files, 29K functions. The full tree is 60x larger. If it falls over at that scale, open an issue.
 
 ## Environment Variables
 

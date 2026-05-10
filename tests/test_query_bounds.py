@@ -55,9 +55,18 @@ class MockCodeUnit:
         self.cyclomatic_complexity = cyclomatic_complexity
 
 
+
+class MockEdge:
+    """Minimal edge matching the surface hub_set reads: kind.value, target_id."""
+    def __init__(self, source_id: str, target_id: str, kind_value: str = "call") -> None:
+        self.source_id = source_id
+        self.target_id = target_id
+        self.kind = _Kind(kind_value)
+
 class MockGraph:
-    def __init__(self, nodes: dict[str, MockCodeUnit]) -> None:
+    def __init__(self, nodes: dict[str, MockCodeUnit], edges: list[MockEdge] | None = None) -> None:
         self.nodes = nodes
+        self.edges: list[MockEdge] = edges or []
 
 
 class MockStore:
@@ -73,8 +82,9 @@ class MockEngine:
         nodes: dict[str, MockCodeUnit],
         callers_map: dict[str, list[dict[str, Any]]] | None = None,
         callees_map: dict[str, list[dict[str, Any]]] | None = None,
+        edges: list[MockEdge] | None = None,
     ) -> None:
-        self._store = MockStore(MockGraph(nodes))
+        self._store = MockStore(MockGraph(nodes, edges))
         self._callers: dict[str, list[dict[str, Any]]] = callers_map or {}
         self._callees: dict[str, list[dict[str, Any]]] = callees_map or {}
 
@@ -138,7 +148,7 @@ def _build_engine() -> MockEngine:
 
     nodes: dict[str, MockCodeUnit] = {
         n: MockCodeUnit(
-            id=i,
+            id=n,
             name=n,
             kind_value="function",
             qualified_name=f"mod.{n}",
@@ -190,7 +200,18 @@ def _build_engine() -> MockEngine:
     assert len(log_debug_caller_names) == 15
     callers["log_debug"] = [_ref(nodes[n]) for n in log_debug_caller_names]
 
-    return MockEngine(nodes, callers_map=callers, callees_map=callees)
+    # Build edge list from callers map (hub_set reads edges, not callers_of).
+    edges: list[MockEdge] = []
+    for target_name, caller_refs in callers.items():
+        target_node = nodes[target_name]
+        for cr in caller_refs:
+            edges.append(MockEdge(
+                source_id=str(cr["id"]),
+                target_id=str(target_node.id),
+                kind_value="call",
+            ))
+
+    return MockEngine(nodes, callers_map=callers, callees_map=callees, edges=edges)
 
 
 # ---------------------------------------------------------------------------

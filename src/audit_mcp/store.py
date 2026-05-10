@@ -23,13 +23,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pickle
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import msgpack
 
 __all__ = ["DurableIndexStore", "IndexState"]
 
@@ -154,21 +153,12 @@ class DurableIndexStore:
         """Transition an index to READY and persist all artifacts."""
         ws = self.workspace(index_id)
 
-        # Persist graph
+        # Persist graph via pickle (CodeGraph has no from_dict/from_json;
+        # pickle faithfully serializes the full object graph).
         try:
-            graph_data = engine.to_json()
-            try:
-                packed = msgpack.packb(graph_data, use_bin_type=True, default=str)
-                (ws / "graph.msgpack").write_bytes(packed)
-            except (OSError, TypeError, ValueError) as exc:
-                _log.warning(
-                    "msgpack write failed for %s, falling back to JSON: %s",
-                    index_id, exc,
-                )
-                (ws / "graph.json").write_text(
-                    json.dumps(graph_data, default=str), encoding="utf-8",
-                )
-        except (OSError, TypeError, ValueError) as exc:
+            with (ws / "graph.pkl").open("wb") as fh:
+                pickle.dump(engine._store._graph, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        except (OSError, pickle.PicklingError, TypeError, AttributeError) as exc:
             _log.warning("Failed to persist graph for %s: %s", index_id, exc)
 
         # Persist summary + preanalysis
@@ -301,29 +291,21 @@ class DurableIndexStore:
             )
 
     def _load_engine_from_disk(self, index_id: str) -> Any | None:
-        """Attempt to rehydrate a QueryEngine from persisted graph file."""
+        """Attempt to rehydrate a QueryEngine from a persisted graph pickle."""
         ws = self.workspace(index_id)
-        msgpack_file = ws / "graph.msgpack"
-        json_file = ws / "graph.json"
+        pkl_file = ws / "graph.pkl"
+        if not pkl_file.exists():
+            return None
         try:
-            from trailmark.models.graph import CodeGraph
             from trailmark.query.api import QueryEngine
 
-            data: dict | None = None
-            if msgpack_file.exists():
-                raw = msgpack_file.read_bytes()
-                data = msgpack.unpackb(raw, raw=False)
-            elif json_file.exists():
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-
-            if data is None:
-                return None
-
-            graph = CodeGraph.from_dict(data)
+            with pkl_file.open("rb") as fh:
+                graph = pickle.load(fh)  # noqa: S301 — trusted local cache
             engine = QueryEngine.from_graph(graph)
             _log.info("rehydrated engine for %s from disk", index_id)
             return engine
-        except (json.JSONDecodeError, KeyError, OSError, ImportError, ValueError, TypeError) as exc:
+        except (OSError, pickle.UnpicklingError, KeyError, ImportError,
+                ValueError, TypeError, AttributeError, ModuleNotFoundError) as exc:
             _log.warning("Failed to rehydrate %s: %s", index_id, exc)
             return None
 

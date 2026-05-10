@@ -105,29 +105,45 @@ def _iter_function_nodes(engine: Any) -> list[Any]:
 def _hub_set_cached(engine_id: int, threshold: int, engine_ref: Any) -> frozenset[str]:
     """Internal lru_cache-backed hub computation.
 
-    ``engine_id`` keys the cache; ``engine_ref`` is the live engine used for
-    the scan. Both are required so the cache invalidates when a new engine
-    instance reuses an old id.
+    Builds an in-degree map from the graph's edge list in a single pass —
+    O(E) instead of the previous O(V * callers_of) which was catastrophically
+    slow on large codebases (82s on Chromium's 29K functions).
     """
     del engine_id  # purely a cache key
-    hubs: set[str] = set()
+
+    # Build in-degree map from the edge list directly.
+    in_degree: dict[str, int] = {}
+    try:
+        edges = engine_ref._store._graph.edges
+    except AttributeError:
+        return frozenset()
+
+    # Collect names of function/method nodes for filtering.
+    func_names: set[str] = set()
+    node_id_to_name: dict[str, str] = {}
     for node in _iter_function_nodes(engine_ref):
         name = getattr(node, "name", None)
-        if not name:
+        nid = getattr(node, "id", None)
+        if name:
+            func_names.add(name)
+        if nid and name:
+            node_id_to_name[nid] = name
+
+    # Count in-degree from call edges.
+    for edge in edges:
+        kind = getattr(edge, "kind", None)
+        kind_value = getattr(kind, "value", kind)
+        if kind_value != "call":
             continue
-        try:
-            callers = engine_ref.callers_of(name)
-        except (AttributeError, KeyError, ValueError, TypeError):
+        target_id = getattr(edge, "target_id", None)
+        if target_id is None:
             continue
-        if callers is None:
-            continue
-        try:
-            in_degree = len(callers)
-        except TypeError:
-            continue
-        if in_degree > threshold:
-            hubs.add(name)
-    return frozenset(hubs)
+        target_name = node_id_to_name.get(target_id)
+        if target_name:
+            in_degree[target_name] = in_degree.get(target_name, 0) + 1
+
+    hubs = frozenset(name for name, deg in in_degree.items() if deg > threshold)
+    return hubs
 
 
 def hub_set(engine: Any, threshold: int) -> frozenset[str]:
