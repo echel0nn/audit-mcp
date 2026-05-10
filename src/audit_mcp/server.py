@@ -809,6 +809,111 @@ def memory_usage() -> dict[str, Any]:
     return index_manager.memory_stats()
 
 
+
+# ---------------------------------------------------------------------------
+# Source-level search (constants, types, assertions, bitfields, macros, raw)
+# ---------------------------------------------------------------------------
+
+
+def _searcher(index_id: str) -> Any:
+    """Return a SourceSearcher for the indexed codebase's root path."""
+    from audit_mcp.source_search import SourceSearcher
+
+    entry = index_manager._indexes.get(index_id)  # noqa: SLF001
+    if entry is None:
+        return None
+    return SourceSearcher(entry.root_path)
+
+
+@mcp.tool()
+def search_constants(index_id: str, pattern: str, limit: int = 50) -> dict[str, Any]:
+    """Search constexpr, static const, and enum constants by regex.
+
+    Finds the VALUES that control security boundaries — bit widths,
+    max counts, buffer sizes, mask constants. These live outside the
+    call graph and are invisible to search_functions."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    results = searcher.search_constants(pattern, limit=limit)
+    return {"matches": [r.to_dict() for r in results], "count": len(results)}
+
+
+@mcp.tool()
+def search_types(index_id: str, pattern: str, limit: int = 50) -> dict[str, Any]:
+    """Search using/typedef type aliases, class/struct/enum declarations.
+
+    Finds type definitions that determine how values are stored — narrowing
+    typedefs, bitfield type aliases, wrapper structs."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    results = searcher.search_types(pattern, limit=limit)
+    return {"matches": [r.to_dict() for r in results], "count": len(results)}
+
+
+@mcp.tool()
+def search_assertions(index_id: str, pattern: str, limit: int = 50) -> dict[str, Any]:
+    """Search static_assert, DCHECK, CHECK statements.
+
+    Finds compile-time and runtime capacity checks. A missing static_assert
+    on a bitfield is the CVE-2024-2887 pattern."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    results = searcher.search_assertions(pattern, limit=limit)
+    return {"matches": [r.to_dict() for r in results], "count": len(results)}
+
+
+@mcp.tool()
+def search_bitfields(index_id: str, pattern: str = "", limit: int = 50) -> dict[str, Any]:
+    """Search BitField<type, offset, size> declarations.
+
+    Returns the bit width and max value for each field. Core tool for
+    finding truncation bugs — a 20-bit field storing a value up to 1M
+    is the exact CVE-2024-2887 pattern."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    results = searcher.search_bitfields(pattern, limit=limit)
+    return {"matches": [r.to_dict() for r in results], "count": len(results)}
+
+
+@mcp.tool()
+def search_macros(index_id: str, pattern: str, limit: int = 50) -> dict[str, Any]:
+    """Search #define macro definitions."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    results = searcher.search_macros(pattern, limit=limit)
+    return {"matches": [r.to_dict() for r in results], "count": len(results)}
+
+
+@mcp.tool()
+def search_source(index_id: str, pattern: str, limit: int = 50) -> dict[str, Any]:
+    """Raw regex search over source text — the escape hatch.
+
+    Use when no structured search tool fits. Searches all C/C++ source
+    and header files in the indexed codebase."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    results = searcher.search_source(pattern, limit=limit)
+    return {"matches": [r.to_dict() for r in results], "count": len(results)}
+
+
+@mcp.tool()
+def search_narrowing_casts(index_id: str, pattern: str = "", limit: int = 50) -> dict[str, Any]:
+    """Find static_cast to narrower integer types on size/index values.
+
+    Integer overflow via narrowing cast is the CVE-2026-2649 pattern.
+    Finds casts where a .size(), count, index, or length is truncated."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    results = searcher.search_narrowing_casts(pattern, limit=limit)
+    return {"matches": [r.to_dict() for r in results], "count": len(results)}
+
 def run_mcp() -> None:
     """Run the MCP server over stdio."""
     mcp.run()
