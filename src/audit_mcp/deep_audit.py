@@ -83,7 +83,10 @@ def find_unreachable_from_entrypoints(engine: Any, gpu_engine: Any = None) -> di
             if node:
                 ep_names.append(node.get("name", ""))
         unreachable_dicts = gpu_engine.unreachable_from(ep_names, max_depth=50)
-        # Convert to the expected output shape
+        # Filter to only real functions (exclude phantom nodes for external APIs
+        # that the GPU engine creates but trailmark doesn't track).
+        # Phantoms have empty file_path; real functions always have a source file.
+        real_func_names = {f.get("name", "") for f in all_funcs}
         unreachable = [
             {
                 "name": d.get("name", ""),
@@ -92,6 +95,8 @@ def find_unreachable_from_entrypoints(engine: Any, gpu_engine: Any = None) -> di
                 "complexity": d.get("cyclomatic_complexity", 0),
             }
             for d in unreachable_dicts
+            if d.get("name", "") in real_func_names
+            and d.get("location", {}).get("file_path", "") != ""
         ]
         return {
             "unreachable_functions": unreachable,
