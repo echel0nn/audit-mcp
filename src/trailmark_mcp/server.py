@@ -288,7 +288,7 @@ def findings(index_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SARIF / weAudit augmentation
+# SARIF augmentation + scanner orchestration
 # ---------------------------------------------------------------------------
 
 
@@ -302,12 +302,97 @@ def augment_sarif(index_id: str, sarif_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def augment_weaudit(index_id: str, weaudit_path: str) -> dict[str, Any]:
-    """Import weAudit audit annotations and overlay on the code graph."""
+def list_scanners() -> dict[str, Any]:
+    """List available source code scanners and whether they are installed.
+
+    Supported: semgrep, bandit, trivy, bearer, gosec, phpstan.
+    A scanner is 'installed' when its binary is on PATH.
+    """
+    from trailmark_mcp.scanners import ScannerRunner
+
+    return {"scanners": ScannerRunner.list_installed()}
+
+
+@mcp.tool()
+def run_scanner(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict[str, Any]:
+    """Execute a SAST scanner on an indexed codebase and import results.
+
+    Runs the scanner, produces SARIF, imports findings into the code graph.
+    Returns a summary of findings found.
+
+    Supported scanners: semgrep, bandit, trivy, bearer, gosec, phpstan.
+    """
+    from trailmark_mcp.scanners import ScannerRunner
+
     engine, err = _require_engine(index_id)
     if err:
         return err
-    return engine.augment_weaudit(weaudit_path)
+    entry = index_manager._indexes.get(index_id)  # noqa: SLF001
+    if entry is None:
+        return {"status": "error", "error": f"Index {index_id!r} not found"}
+
+    try:
+        sarif_path = ScannerRunner.run(scanner, entry.root_path, timeout_seconds)
+    except (ValueError, RuntimeError, OSError) as exc:
+        return {"status": "error", "error": str(exc)}
+
+    # Import SARIF results into the graph
+    import_result = engine.augment_sarif(str(sarif_path))
+
+    # Clean up temp file
+    try:
+        sarif_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    return {
+        "status": "ready",
+        "scanner": scanner,
+        "target": entry.root_path,
+        "import_result": import_result,
+    }
+
+
+@mcp.tool()
+def scan_and_correlate(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict[str, Any]:
+    """Run a scanner, import results, and correlate with graph properties.
+
+    The killer query: 'semgrep found 47 SQLi. Of those, 12 are tainted
+    from entrypoints. Of those, 3 have blast radius > 50. Start there.'
+
+    Returns findings sorted by risk_score (tainted + entrypoint-reachable
+    + high blast radius = highest priority).
+    """
+    from trailmark_mcp.scanners import ScannerRunner
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    entry = index_manager._indexes.get(index_id)  # noqa: SLF001
+    if entry is None:
+        return {"status": "error", "error": f"Index {index_id!r} not found"}
+
+    # Step 1: Run the scanner
+    try:
+        sarif_path = ScannerRunner.run(scanner, entry.root_path, timeout_seconds)
+    except (ValueError, RuntimeError, OSError) as exc:
+        return {"status": "error", "error": str(exc)}
+
+    # Step 2: Import SARIF into graph
+    engine.augment_sarif(str(sarif_path))
+    try:
+        sarif_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    # Step 3: Correlate findings with graph properties
+    correlation = ScannerRunner.correlate_findings(engine, entry.preanalysis)
+    return {
+        "status": "ready",
+        "scanner": scanner,
+        "target": entry.root_path,
+        **correlation,
+    }
 
 
 # ---------------------------------------------------------------------------
