@@ -36,16 +36,20 @@ class IndexEntry:
 
 
 class IndexManager:
-    """Thread-safe registry of indexed codebases.
+    """Thread-safe registry of indexed codebases with durable persistence.
 
     ``start_index`` returns immediately with a stable ``index_id``; the parse
-    and pre-analysis run on a daemon thread. Callers poll with ``poll`` and
-    fetch a ready engine with ``get_engine``.
+    and pre-analysis run on a daemon thread. Ready indexes are persisted to disk
+    via ``DurableIndexStore`` and survive process restarts.
     """
 
     def __init__(self) -> None:
+        from audit_mcp.store import DurableIndexStore
+
         self._lock = threading.Lock()
         self._indexes: dict[str, IndexEntry] = {}
+        self._store = DurableIndexStore()
+        self._recover_from_store()
 
     def start_index(self, path: str, language: str = "auto") -> str:
         """Begin indexing ``path``. Returns the index id (idempotent if ready)."""
@@ -140,6 +144,9 @@ class IndexManager:
                 entry.preanalysis = preanalysis
                 entry.status = "ready"
                 entry.finished_at = time.time()
+            # Persist to durable store so index survives restart
+            self._store.register(index_id, entry.root_path, entry.language)
+            self._store.mark_ready(index_id, engine, summary, preanalysis)
             _log.info(
                 "index %s ready: %d functions, %d edges (%.1fs) "
                 "[%d parsed, %d cached, %d failed]",
@@ -157,3 +164,33 @@ class IndexManager:
                 entry.status = "error"
                 entry.error = f"{type(exc).__name__}: {exc}"
                 entry.finished_at = time.time()
+            self._store.mark_error(index_id, f"{type(exc).__name__}: {exc}")
+
+    def _recover_from_store(self) -> None:
+        """Hydrate in-memory registry from durable store on startup."""
+        for record_dict in self._store.list_indexes():
+            if record_dict.get("status") == "ready":
+                index_id = record_dict["index_id"]
+                with self._lock:
+                    if index_id not in self._indexes:
+                        self._indexes[index_id] = IndexEntry(
+                            index_id=index_id,
+                            root_path=record_dict.get("root_path", ""),
+                            language=record_dict.get("language", "auto"),
+                            status="ready",
+                            started_at=record_dict.get("created_at", 0.0),
+                            finished_at=record_dict.get("finished_at", 0.0),
+                            summary=record_dict.get("summary", {}),
+                        )
+        recovered = sum(1 for e in self._indexes.values() if e.status == "ready")
+        if recovered:
+            _log.info("recovered %d ready indexes from durable store", recovered)
+
+    def close_index(self, index_id: str) -> bool:
+        """Release in-memory engine, keep persistent data."""
+        with self._lock:
+            entry = self._indexes.pop(index_id, None)
+        if entry is None:
+            return False
+        self._store.close_index(index_id)
+        return True
