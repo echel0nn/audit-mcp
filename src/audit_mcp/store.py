@@ -138,9 +138,9 @@ class DurableIndexStore:
             status=IndexState.INDEXING,
             created_at=time.time(),
         )
-        self._write_state(index_id, record)
         with self._lock:
             self._records[index_id] = record
+            self._write_state(index_id, record)
         return record
 
     def mark_ready(

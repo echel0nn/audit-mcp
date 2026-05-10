@@ -211,18 +211,32 @@ class FastIndexer:
     def _composite_hash(
         self, files: list[tuple[str, str]], root: Path,
     ) -> str:
-        """SHA256 over (relative_path, content_hash) pairs sorted by path."""
+        """SHA256 over (relative_path, content_hash) pairs sorted by path.
+
+        Includes the trailmark version so graph cache invalidates on upgrades.
+        """
+        try:
+            import trailmark
+            tm_version = getattr(trailmark, "__version__", "unknown")
+        except ImportError:
+            tm_version = "unavailable"
+
         pairs: list[tuple[str, str]] = []
         for fpath, _lang in files:
             try:
                 rel = str(Path(fpath).resolve().relative_to(root)).replace("\\", "/")
             except ValueError:
                 rel = fpath
-            pairs.append((rel, self._hash_file(fpath)))
+            content_hash = self._hash_file(fpath)
+            if not content_hash:
+                # Skip unreadable files — they'll show up as failed in parse
+                continue
+            pairs.append((rel, content_hash))
         pairs.sort(key=lambda p: p[0])
         h = hashlib.sha256()
+        h.update(f"trailmark:{tm_version}\n".encode())
         for rel, content_hash in pairs:
-            h.update(f"{rel}:{content_hash}".encode())
+            h.update(f"{rel}:{content_hash}\n".encode())
         return h.hexdigest()
 
     def _graph_cache_path(self, composite_hash: str) -> Path:
@@ -429,7 +443,7 @@ class FastIndexer:
         """Remove all cached parse results and graph caches. Returns count removed."""
         count = 0
         if self._cache_dir.exists():
-            for pattern in ("*.json", "*.msgpack"):
+            for pattern in ("*.json", "*.pkl"):
                 for f in self._cache_dir.rglob(pattern):
                     f.unlink(missing_ok=True)
                     count += 1
@@ -459,7 +473,7 @@ class FastIndexer:
             if graph_dir not in f.parents
         ]
         graph_entries = (
-            list(graph_dir.rglob("*.msgpack")) if graph_dir.exists() else []
+            list(graph_dir.rglob("*.pkl")) if graph_dir.exists() else []
         )
         all_entries = parse_entries + graph_entries
         total_size = sum(f.stat().st_size for f in all_entries)

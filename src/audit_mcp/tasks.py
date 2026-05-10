@@ -13,6 +13,7 @@ in the background.
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -29,6 +30,7 @@ _RUN_EXCEPTIONS: tuple[type[BaseException], ...] = (
     RuntimeError,
     TypeError,
     KeyError,
+    subprocess.SubprocessError,
 )
 
 

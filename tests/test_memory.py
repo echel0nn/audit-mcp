@@ -31,7 +31,7 @@ def _add_ready_entry(mgr: IndexManager, index_id: str) -> IndexEntry:
         summary={"functions": 10},
     )
     mgr._indexes[index_id] = entry
-    mgr._access_order.append(index_id)
+    mgr._access_order[index_id] = None
     return entry
 
 

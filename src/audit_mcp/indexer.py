@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,7 +59,7 @@ class IndexManager:
         self._lock = threading.Lock()
         self._indexes: dict[str, IndexEntry] = {}
         self._store = DurableIndexStore()
-        self._access_order: list[str] = []  # LRU: oldest first
+        self._access_order: OrderedDict[str, None] = OrderedDict()
         self._max_loaded = max_loaded_engines or int(
             os.environ.get("AUDIT_MCP_MAX_ENGINES", "8")
         )
@@ -210,7 +211,7 @@ class IndexManager:
                 progress.failed_files,
                 gpu_info.get("backend", "?"),
             )
-        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        except (OSError, ValueError, RuntimeError, ImportError, MemoryError) as exc:
             _log.exception("index %s failed", index_id)
             with self._lock:
                 entry.status = "error"
@@ -252,33 +253,24 @@ class IndexManager:
     # ------------------------------------------------------------------
 
     def _touch_locked(self, index_id: str) -> None:
-        """Move *index_id* to most-recently-used (must hold _lock)."""
-        try:
-            self._access_order.remove(index_id)
-        except ValueError:
-            pass
-        self._access_order.append(index_id)
+        """Move *index_id* to most-recently-used (must hold _lock). O(1)."""
+        self._access_order.pop(index_id, None)
+        self._access_order[index_id] = None
 
     def _maybe_evict_locked(self) -> None:
         """Evict LRU engines until loaded count <= budget (must hold _lock)."""
-        loaded = [
-            iid for iid, e in self._indexes.items()
-            if e.engine is not None
-        ]
-        while len(loaded) > self._max_loaded and self._access_order:
-            victim_id = self._access_order.pop(0)
+        loaded_count = sum(1 for e in self._indexes.values() if e.engine is not None)
+        while loaded_count > self._max_loaded and self._access_order:
+            victim_id, _ = self._access_order.popitem(last=False)  # pop oldest
             victim = self._indexes.get(victim_id)
             if victim is not None and victim.engine is not None:
                 _log.info(
                     "evicting engine %s (loaded=%d, budget=%d)",
-                    victim_id, len(loaded), self._max_loaded,
+                    victim_id, loaded_count, self._max_loaded,
                 )
                 victim.engine = None
                 self._eviction_count += 1
-                loaded = [
-                    iid for iid, e in self._indexes.items()
-                    if e.engine is not None
-                ]
+                loaded_count -= 1
 
     def memory_stats(self) -> dict[str, Any]:
         """Return engine loading stats for the memory_usage tool."""
