@@ -76,6 +76,11 @@ def _require_engine(index_id: str) -> tuple[Any, dict[str, Any] | None]:
     return None, snapshot  # status == "pending" / "indexing" / unknown id
 
 
+def _gpu(index_id: str) -> Any:
+    """Return the GpuGraphEngine for *index_id*, or None."""
+    return index_manager.get_gpu_engine(index_id)
+
+
 def _annotation_kind(kind: str) -> Any:
     """Resolve a string into the trailmark ``AnnotationKind`` enum."""
     from trailmark.models.annotations import AnnotationKind
@@ -154,7 +159,7 @@ def preanalysis(index_id: str) -> dict[str, Any]:
     engine, err = _require_engine(index_id)
     if err is not None:
         return err
-    lazy = LazyPreanalysis(engine)
+    lazy = LazyPreanalysis(engine, gpu_engine=_gpu(index_id))
     return lazy.full_preanalysis()
 
 
@@ -174,7 +179,7 @@ def callers_of(
     if err is not None:
         return err
     bounds = QueryBounds(limit=limit, offset=offset, exclude_hubs=exclude_hubs)
-    result = bounded_callers(engine, name, bounds)
+    result = bounded_callers(engine, name, bounds, gpu_engine=_gpu(index_id))
     return _bounded_envelope(result, "callers")
 
 
@@ -190,7 +195,7 @@ def callees_of(
     if err is not None:
         return err
     bounds = QueryBounds(limit=limit, offset=offset, exclude_hubs=False)
-    result = bounded_callees(engine, name, bounds)
+    result = bounded_callees(engine, name, bounds, gpu_engine=_gpu(index_id))
     return _bounded_envelope(result, "callees")
 
 
@@ -211,7 +216,7 @@ def ancestors_of(
     if err is not None:
         return err
     bounds = QueryBounds(depth=depth, limit=limit, offset=offset, exclude_hubs=exclude_hubs)
-    result = bounded_ancestors(engine, name, bounds)
+    result = bounded_ancestors(engine, name, bounds, gpu_engine=_gpu(index_id))
     return _bounded_envelope(result, "ancestors")
 
 
@@ -232,7 +237,7 @@ def reachable_from(
     if err is not None:
         return err
     bounds = QueryBounds(depth=depth, limit=limit, offset=offset, exclude_hubs=exclude_hubs)
-    result = bounded_reachable(engine, name, bounds)
+    result = bounded_reachable(engine, name, bounds, gpu_engine=_gpu(index_id))
     return _bounded_envelope(result, "reachable")
 
 
@@ -616,7 +621,7 @@ def _dead_code_sync(index_id: str) -> dict[str, Any]:
     engine = index_manager.get_engine(index_id)
     if engine is None:
         return {"status": "error", "error": f"Engine not available for {index_id}"}
-    return find_dead_code(engine)
+    return find_dead_code(engine, gpu_engine=index_manager.get_gpu_engine(index_id))
 
 
 def _unreachable_sync(index_id: str) -> dict[str, Any]:
@@ -625,7 +630,7 @@ def _unreachable_sync(index_id: str) -> dict[str, Any]:
     engine = index_manager.get_engine(index_id)
     if engine is None:
         return {"status": "error", "error": f"Engine not available for {index_id}"}
-    return find_unreachable_from_entrypoints(engine)
+    return find_unreachable_from_entrypoints(engine, gpu_engine=index_manager.get_gpu_engine(index_id))
 
 
 @mcp.tool()

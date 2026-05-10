@@ -25,12 +25,12 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 
-def find_dead_code(engine: Any) -> dict[str, Any]:
+def find_dead_code(engine: Any, gpu_engine: Any = None) -> dict[str, Any]:
     """Find functions with zero callers that are NOT entrypoints.
 
-    These functions are never called — they're dead code. Removing them
-    reduces the codebase's attack surface. Safe to delete unless they're
-    test helpers, CLI commands, or dynamically invoked.
+    When ``gpu_engine`` is provided, uses precomputed in-degree from the
+    CSR adjacency matrix (O(1) per node) instead of calling
+    ``engine.callers_of()`` per function (O(V * avg_degree)).
     """
     attack = engine.attack_surface()
     entrypoint_ids = {ep.get("node_id") for ep in attack}
@@ -43,8 +43,12 @@ def find_dead_code(engine: Any) -> dict[str, Any]:
         node_id = func.get("id", "")
         if node_id in entrypoint_ids:
             continue
-        callers = engine.callers_of(name)
-        if not callers:
+        if gpu_engine is not None:
+            has_callers = gpu_engine.in_degree_of(name) > 0
+        else:
+            callers = engine.callers_of(name)
+            has_callers = bool(callers)
+        if not has_callers:
             dead.append({
                 "name": name,
                 "file": func.get("location", {}).get("file_path", ""),
@@ -61,21 +65,46 @@ def find_dead_code(engine: Any) -> dict[str, Any]:
     }
 
 
-def find_unreachable_from_entrypoints(engine: Any) -> dict[str, Any]:
+def find_unreachable_from_entrypoints(engine: Any, gpu_engine: Any = None) -> dict[str, Any]:
     """Find functions that no entrypoint can transitively reach.
 
-    These functions cannot be triggered by an external attacker.
-    Any SAST finding in these functions is lower priority — it's
-    only exploitable if there's an internal caller path the graph
-    doesn't see (dynamic dispatch, reflection).
+    When ``gpu_engine`` is provided, runs one batched BFS from ALL
+    entrypoints simultaneously via SpMV instead of serial
+    ``engine.reachable_from()`` per entrypoint.
     """
     attack = engine.attack_surface()
+    all_funcs = _get_all_functions(engine)
 
-    # Collect everything reachable from any entrypoint
+    # GPU fast path — one batched SpMV covers all entrypoints
+    if gpu_engine is not None:
+        ep_names = []
+        for ep in attack:
+            node = _find_node_by_id(engine, ep.get("node_id", ""))
+            if node:
+                ep_names.append(node.get("name", ""))
+        unreachable_dicts = gpu_engine.unreachable_from(ep_names, max_depth=50)
+        # Convert to the expected output shape
+        unreachable = [
+            {
+                "name": d.get("name", ""),
+                "file": d.get("location", {}).get("file_path", ""),
+                "line": d.get("location", {}).get("start_line", 0),
+                "complexity": d.get("cyclomatic_complexity", 0),
+            }
+            for d in unreachable_dicts
+        ]
+        return {
+            "unreachable_functions": unreachable,
+            "count": len(unreachable),
+            "total_functions": len(all_funcs),
+            "reachable_functions": len(all_funcs) - len(unreachable),
+            "unreachable_percentage": round(100 * len(unreachable) / max(len(all_funcs), 1), 1),
+        }
+
+    # CPU fallback — serial reachable_from per entrypoint
     reachable_ids: set[str] = set()
     for ep in attack:
         node_id = ep.get("node_id", "")
-        # Get the function name for this entrypoint
         node = _find_node_by_id(engine, node_id)
         if node:
             name = node.get("name", "")
@@ -83,9 +112,7 @@ def find_unreachable_from_entrypoints(engine: Any) -> dict[str, Any]:
             reachable_ids.update(r.get("id", "") for r in reachable)
             reachable_ids.add(node_id)
 
-    all_funcs = _get_all_functions(engine)
     unreachable: list[dict[str, Any]] = []
-
     for func in all_funcs:
         node_id = func.get("id", "")
         if node_id not in reachable_ids:

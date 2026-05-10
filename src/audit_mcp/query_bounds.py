@@ -209,19 +209,25 @@ def _safe_call(engine: Any, method_name: str, *args: Any) -> list[dict[str, Any]
         return []
 
 
-def bounded_callers(engine: Any, name: str, bounds: QueryBounds) -> BoundedResult:
+def bounded_callers(engine: Any, name: str, bounds: QueryBounds, gpu_engine: Any = None) -> BoundedResult:
     """Direct callers of *name*, with hub filtering and paging."""
     bounds = clamp_bounds(bounds)
     hubs = hub_set(engine, bounds.hub_threshold) if bounds.exclude_hubs else frozenset()
-    callers = _safe_call(engine, "callers_of", name)
+    if gpu_engine is not None:
+        callers = gpu_engine.callers_of(name)
+    else:
+        callers = _safe_call(engine, "callers_of", name)
     return _filter_and_page(callers, bounds, hubs)
 
 
-def bounded_callees(engine: Any, name: str, bounds: QueryBounds) -> BoundedResult:
+def bounded_callees(engine: Any, name: str, bounds: QueryBounds, gpu_engine: Any = None) -> BoundedResult:
     """Direct callees of *name*, with hub filtering and paging."""
     bounds = clamp_bounds(bounds)
     hubs = hub_set(engine, bounds.hub_threshold) if bounds.exclude_hubs else frozenset()
-    callees = _safe_call(engine, "callees_of", name)
+    if gpu_engine is not None:
+        callees = gpu_engine.callees_of(name)
+    else:
+        callees = _safe_call(engine, "callees_of", name)
     return _filter_and_page(callees, bounds, hubs)
 
 
@@ -230,24 +236,29 @@ def _bfs(
     name: str,
     bounds: QueryBounds,
     direction: str,
+    gpu_engine: Any = None,
 ) -> BoundedResult:
     """Generic depth-bounded BFS in the call graph.
 
-    *direction* is the engine method used to expand a node:
-    ``callers_of`` for backward (ancestors) or ``callees_of`` for forward
-    (reachable). Hubs are pruned (both filtered out of results AND not
-    expanded) so the frontier stays bounded.
+    When *gpu_engine* is available, delegates to its SpMV-based BFS
+    (``ancestors_of`` or ``reachable_from``). Otherwise falls back to
+    the Python-level ``engine.callers_of``/``engine.callees_of`` loop.
     """
     bounds = clamp_bounds(bounds)
     hubs = hub_set(engine, bounds.hub_threshold) if bounds.exclude_hubs else frozenset()
 
+    # GPU fast path — single SpMV BFS, already depth-bounded inside the engine
+    if gpu_engine is not None:
+        if direction == "callers_of":
+            raw = gpu_engine.ancestors_of(name, max_depth=bounds.depth)
+        else:
+            raw = gpu_engine.reachable_from(name, max_depth=bounds.depth)
+        return _filter_and_page(raw, bounds, hubs)
+
+    # CPU fallback — manual BFS with the trailmark engine
     visited: set[str] = {name}
     found: list[dict[str, Any]] = []
-    # frontier stores (node_name, depth_already_traversed)
     frontier: deque[tuple[str, int]] = deque([(name, 0)])
-
-    # Hard cap on nodes explored to keep BFS bounded even if depth allows
-    # huge fan-out. We cap exploration at HARD_LIMIT_CAP * 4 candidate edges.
     explore_cap = HARD_LIMIT_CAP * 4
     explored = 0
 
@@ -266,25 +277,21 @@ def _bfs(
                 continue
             visited.add(n_name)
             if bounds.exclude_hubs and n_name in hubs:
-                # Don't include hubs in results and don't expand through them.
                 continue
             found.append(neighbor)
             frontier.append((n_name, depth + 1))
 
-    # _filter_and_page would re-filter hubs (already excluded above) but we
-    # still want its paging + truncation metadata. Pass an empty hub set so it
-    # doesn't double-work.
     return _filter_and_page(found, bounds, frozenset())
 
 
-def bounded_ancestors(engine: Any, name: str, bounds: QueryBounds) -> BoundedResult:
+def bounded_ancestors(engine: Any, name: str, bounds: QueryBounds, gpu_engine: Any = None) -> BoundedResult:
     """Transitive callers of *name* via depth-bounded BFS."""
-    return _bfs(engine, name, bounds, "callers_of")
+    return _bfs(engine, name, bounds, "callers_of", gpu_engine=gpu_engine)
 
 
-def bounded_reachable(engine: Any, name: str, bounds: QueryBounds) -> BoundedResult:
+def bounded_reachable(engine: Any, name: str, bounds: QueryBounds, gpu_engine: Any = None) -> BoundedResult:
     """Transitive callees of *name* via depth-bounded BFS."""
-    return _bfs(engine, name, bounds, "callees_of")
+    return _bfs(engine, name, bounds, "callees_of", gpu_engine=gpu_engine)
 
 
 def bounded_paths(
