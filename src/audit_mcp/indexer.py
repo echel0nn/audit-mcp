@@ -123,11 +123,14 @@ class IndexManager:
         if entry is None:
             return
         try:
-            from trailmark.query.api import QueryEngine
+            from audit_mcp.fast_indexer import FastIndexer, IndexProgress
 
-            engine = QueryEngine.from_directory(
+            progress = IndexProgress()
+            indexer = FastIndexer()
+            engine = indexer.index(
                 entry.root_path,
                 language=entry.language,
+                progress=progress,
             )
             summary = engine.summary()
             preanalysis = engine.preanalysis()
@@ -138,11 +141,15 @@ class IndexManager:
                 entry.status = "ready"
                 entry.finished_at = time.time()
             _log.info(
-                "index %s ready: %d functions, %d edges (%.1fs)",
+                "index %s ready: %d functions, %d edges (%.1fs) "
+                "[%d parsed, %d cached, %d failed]",
                 index_id,
                 summary.get("functions", 0),
                 summary.get("call_edges", 0),
                 entry.finished_at - entry.started_at,
+                progress.parsed_files,
+                progress.cached_files,
+                progress.failed_files,
             )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             _log.exception("index %s failed", index_id)

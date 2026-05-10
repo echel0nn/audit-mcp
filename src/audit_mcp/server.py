@@ -22,7 +22,7 @@ __all__ = ["mcp", "run_mcp", "index_manager"]
 
 _log = logging.getLogger(__name__)
 
-mcp = FastMCP("trailmark-mcp")
+mcp = FastMCP("audit-mcp")
 index_manager = IndexManager()
 
 
@@ -599,6 +599,26 @@ def plan_partitions(path: str) -> dict[str, Any]:
             for p in plan.partitions
         ],
     }
+
+
+@mcp.tool()
+def cache_stats() -> dict[str, Any]:
+    """Return parse cache size and entry count.
+
+    The cache stores SHA256-indexed parse results so unchanged files
+    are never re-parsed. Second index of the same codebase: <1 second."""
+    from audit_mcp.fast_indexer import FastIndexer
+
+    return FastIndexer().cache_stats()
+
+
+@mcp.tool()
+def clear_cache() -> dict[str, Any]:
+    """Remove all cached parse results. Forces full re-parse on next index."""
+    from audit_mcp.fast_indexer import FastIndexer
+
+    count = FastIndexer().clear_cache()
+    return {"status": "ok", "cleared_entries": count}
 
 
 def run_mcp() -> None:
