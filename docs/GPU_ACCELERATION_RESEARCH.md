@@ -311,3 +311,44 @@ CPython's graph (82K functions, 564K edges) sits in the Medium tier — 16-29x s
 Full Chromium (~2M functions, ~10M+ edges) would be in the XL tier — 56x single SpMV.
 
 The adaptive threshold should be ~50K edges. Below that, GPU transfer overhead dominates. Above it, the 3080 pulls away hard.
+
+
+---
+
+## Full Chromium Benchmark (715K functions, 7.4M edges)
+
+Tested on full chromium/src checkout -- 163K files, 110K parsed C/C++.
+
+| Metric | Value |
+|---|---|
+| Functions | 715,138 |
+| Call edges | 7,385,537 |
+| Entrypoints | 977 |
+| GPU CSR nodes | 2,644,560 |
+| GPU CSR edges | 3,461,773 |
+| Cold index | 31.6 min |
+| GPU engine build | 25.8s |
+| Dead code (GPU) | 541,850 in 1.4s |
+| Hub detection | 7,113 hubs in 6.3ms |
+| Search | 50/6,330 in 600ms |
+| Memory | ~4 GB RSS |
+
+### Dead Code False Positive Problem
+
+75.8% reported dead. Cross-validated: GPU and trailmark agree 500/500.
+The measurement is correct. The interpretation is misleading.
+
+Chromium uses 70%+ indirect dispatch (virtual methods, callbacks, macros,
+templates, Mojo IPC). Tree-sitter AST analysis sees none of these call
+paths. Every virtual override, every callback target, every macro-dispatched
+handler shows zero static callers.
+
+The tool works correctly on direct-call codebases (C, Go, Python, Rust).
+On C++ with heavy polymorphism, the false positive rate for dead code
+is catastrophic. A future fix: integrate with clangd or compile_commands.json
+for compiler-resolved call graphs instead of AST-level analysis.
+
+### Known Scaling Issues at 715K Functions
+
+- Warm re-index: 1,231s (pickle load of 2.6M-node graph)
+- Unreachable analysis: timed out (977 entrypoints x depth-50 batched BFS on 2.6M nodes)
