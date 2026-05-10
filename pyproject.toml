@@ -5,13 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "audit-mcp"
 version = "0.1.0"
-description = "MCP server wrapping Trail of Bits Trailmark for code graph analysis"
+description = "Graph-first source code audit MCP server — powered by Trailmark"
 requires-python = ">=3.12"
 license = "AGPL-3.0-or-later"
+readme = "README.md"
 
 dependencies = [
     "trailmark>=0.3.0",
-    "fastmcp>=0.4.0",
+    "fastmcp>=2.0.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "msgpack>=1.0.0",
@@ -32,3 +33,7 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

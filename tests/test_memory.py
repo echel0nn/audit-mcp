@@ -1,15 +1,8 @@
 """Tests for LRU engine eviction in IndexManager."""
 from __future__ import annotations
 
-import sys
 import time
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-# Ensure src/ is importable.
-_src = str(Path(__file__).resolve().parent.parent / "src")
-if _src not in sys.path:
-    sys.path.insert(0, _src)
 
 from audit_mcp.indexer import IndexEntry, IndexManager
 

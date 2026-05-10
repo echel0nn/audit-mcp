@@ -7,13 +7,9 @@ without trailmark installed.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from audit_mcp.lazy_preanalysis import LazyPreanalysis, get_all_function_nodes  # noqa: E402
+from audit_mcp.lazy_preanalysis import LazyPreanalysis, get_all_function_nodes
 
 # ---------------------------------------------------------------------------
 # Mock engine surface
