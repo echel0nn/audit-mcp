@@ -1,7 +1,7 @@
 """HTTP transport for Trailmark MCP tools.
 
 Auto-introspects every ``@mcp.tool()``-registered tool from
-:mod:`trailmark_mcp.server` and exposes it as ``POST /tools/{name}``. The
+:mod:`audit_mcp.server` and exposes it as ``POST /tools/{name}``. The
 ``mcp`` and ``index_manager`` singletons are shared with the stdio path so
 HTTP and stdio callers see the same in-memory index registry.
 """
@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI
 
-from trailmark_mcp.server import index_manager, mcp
+from audit_mcp.server import index_manager, mcp
 
 __all__ = ["create_app", "run_http"]
 
@@ -108,11 +108,11 @@ def create_app() -> FastAPI:
 def run_http(host: str | None = None, port: int | None = None) -> None:
     """Run the HTTP API server with uvicorn.
 
-    Host/port may be overridden via env vars ``TRAILMARK_MCP_HTTP_HOST``
-    (default ``127.0.0.1``) and ``TRAILMARK_MCP_HTTP_PORT`` (default ``18822``).
+    Host/port may be overridden via env vars ``AUDIT_MCP_HTTP_HOST``
+    (default ``127.0.0.1``) and ``AUDIT_MCP_HTTP_PORT`` (default ``18822``).
     """
     import uvicorn  # local import: stdio path doesn't need uvicorn loaded
 
-    resolved_host = host or os.environ.get("TRAILMARK_MCP_HTTP_HOST", "127.0.0.1")
-    resolved_port = port or int(os.environ.get("TRAILMARK_MCP_HTTP_PORT", "18822"))
+    resolved_host = host or os.environ.get("AUDIT_MCP_HTTP_HOST", "127.0.0.1")
+    resolved_port = port or int(os.environ.get("AUDIT_MCP_HTTP_PORT", "18822"))
     uvicorn.run(create_app(), host=resolved_host, port=resolved_port, log_level="info")

@@ -16,7 +16,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from trailmark_mcp.indexer import IndexManager
+from audit_mcp.indexer import IndexManager
 
 __all__ = ["mcp", "run_mcp", "index_manager"]
 
@@ -308,7 +308,7 @@ def list_scanners() -> dict[str, Any]:
     Supported: semgrep, bandit, trivy, bearer, gosec, phpstan.
     A scanner is 'installed' when its binary is on PATH.
     """
-    from trailmark_mcp.scanners import ScannerRunner
+    from audit_mcp.scanners import ScannerRunner
 
     return {"scanners": ScannerRunner.list_installed()}
 
@@ -322,7 +322,7 @@ def run_scanner(index_id: str, scanner: str, timeout_seconds: int = 600) -> dict
 
     Supported scanners: semgrep, bandit, trivy, bearer, gosec, phpstan.
     """
-    from trailmark_mcp.scanners import ScannerRunner
+    from audit_mcp.scanners import ScannerRunner
 
     engine, err = _require_engine(index_id)
     if err:
@@ -363,7 +363,7 @@ def scan_and_correlate(index_id: str, scanner: str, timeout_seconds: int = 600) 
     Returns findings sorted by risk_score (tainted + entrypoint-reachable
     + high blast radius = highest priority).
     """
-    from trailmark_mcp.scanners import ScannerRunner
+    from audit_mcp.scanners import ScannerRunner
 
     engine, err = _require_engine(index_id)
     if err:
@@ -478,6 +478,84 @@ def detect_languages(path: str) -> dict[str, Any]:
     import trailmark
 
     return {"path": path, "languages": list(trailmark.detect_languages(path))}
+
+
+# ---------------------------------------------------------------------------
+# Deep audit tools (graph-aware, our differentiator)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def dead_code(index_id: str) -> dict[str, Any]:
+    """Find functions with zero callers that are not entrypoints.
+
+    Dead code = never called. Removing it reduces attack surface.
+    Sorted by complexity (most complex dead code first)."""
+    from audit_mcp.deep_audit import find_dead_code
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    return find_dead_code(engine)
+
+
+@mcp.tool()
+def unreachable_from_entrypoints(index_id: str) -> dict[str, Any]:
+    """Find functions no external entrypoint can transitively reach.
+
+    Any SAST finding in these functions is lower priority — not exploitable
+    by external attackers (unless dynamic dispatch bypasses static analysis)."""
+    from audit_mcp.deep_audit import find_unreachable_from_entrypoints
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    return find_unreachable_from_entrypoints(engine)
+
+
+@mcp.tool()
+def taint_paths_to(index_id: str, sink_name: str, max_depth: int = 20) -> dict[str, Any]:
+    """Find all entrypoint-to-sink call paths for a dangerous function.
+
+    Answers: 'Is this eval/exec/SQL query reachable from the network?'
+    Returns every concrete path from every entrypoint to the named sink."""
+    from audit_mcp.deep_audit import taint_paths_to_sink
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    return taint_paths_to_sink(engine, sink_name, max_depth)
+
+
+@mcp.tool()
+def fuzzing_targets(index_id: str, min_complexity: int = 10, limit: int = 20) -> dict[str, Any]:
+    """Identify the highest-value fuzzing targets.
+
+    Ranks functions by: tainted from untrusted input + high complexity +
+    high blast radius + is entrypoint. Returns: 'fuzz these first.'"""
+    from audit_mcp.deep_audit import suggest_fuzzing_targets
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    return suggest_fuzzing_targets(engine, min_complexity, limit)
+
+
+@mcp.tool()
+def attack_surface_diff(index_id_a: str, index_id_b: str) -> dict[str, Any]:
+    """Compare attack surfaces between two indexed codebase versions.
+
+    Answers: 'Did this PR / release change our attack surface?'
+    Reports new/removed entrypoints, blast radius changes, structural diff."""
+    from audit_mcp.deep_audit import diff_attack_surface
+
+    engine_a, err_a = _require_engine(index_id_a)
+    if err_a:
+        return err_a
+    engine_b, err_b = _require_engine(index_id_b)
+    if err_b:
+        return err_b
+    return diff_attack_surface(engine_a, engine_b)
 
 
 def run_mcp() -> None:

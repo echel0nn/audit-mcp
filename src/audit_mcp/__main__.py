@@ -13,10 +13,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.mode == "http":
-        from trailmark_mcp.http_api import run_http
+        from audit_mcp.http_api import run_http
         run_http(host=args.host, port=args.port)
     else:
-        from trailmark_mcp.server import run_mcp
+        from audit_mcp.server import run_mcp
         run_mcp()
     return 0
 
