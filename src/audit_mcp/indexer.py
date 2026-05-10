@@ -32,6 +32,7 @@ class IndexEntry:
     started_at: float = 0.0
     finished_at: float = 0.0
     engine: Any = None  # trailmark QueryEngine once status == "ready"
+    gpu_engine: Any = None  # GpuGraphEngine (optional, built at index time)
     summary: dict[str, Any] = field(default_factory=dict)
     preanalysis: dict[str, Any] = field(default_factory=dict)
 
@@ -147,6 +148,18 @@ class IndexManager:
                     self._maybe_evict_locked()
         return engine
 
+    def get_gpu_engine(self, index_id: str) -> Any:
+        """Return the GpuGraphEngine if available, else None.
+
+        Does NOT trigger disk reload — the GPU engine is only available
+        if the index was built in this process (not recovered from disk).
+        """
+        with self._lock:
+            entry = self._indexes.get(index_id)
+            if entry is None or entry.status != "ready":
+                return None
+            return entry.gpu_engine
+
     def list_indexes(self) -> list[dict[str, Any]]:
         """Return a snapshot of every index entry."""
         with self._lock:
@@ -160,6 +173,7 @@ class IndexManager:
             return
         try:
             from audit_mcp.fast_indexer import FastIndexer, IndexProgress
+            from audit_mcp.gpu_graph import from_trailmark
 
             progress = IndexProgress()
             indexer = FastIndexer()
@@ -170,8 +184,12 @@ class IndexManager:
             )
             summary = engine.summary()
             preanalysis = engine.preanalysis()
+
+            # Build GPU graph engine (CSR adjacency + optional CUDA)
+            gpu_engine = from_trailmark(engine)
             with self._lock:
                 entry.engine = engine
+                entry.gpu_engine = gpu_engine
                 entry.summary = summary
                 entry.preanalysis = preanalysis
                 entry.status = "ready"
@@ -179,9 +197,10 @@ class IndexManager:
             # Persist to durable store so index survives restart
             self._store.register(index_id, entry.root_path, entry.language)
             self._store.mark_ready(index_id, engine, summary, preanalysis)
+            gpu_info = gpu_engine.info() if gpu_engine else {"backend": "unavailable"}
             _log.info(
                 "index %s ready: %d functions, %d edges (%.1fs) "
-                "[%d parsed, %d cached, %d failed]",
+                "[parsed=%d cached=%d failed=%d] gpu=%s",
                 index_id,
                 summary.get("functions", 0),
                 summary.get("call_edges", 0),
@@ -189,6 +208,7 @@ class IndexManager:
                 progress.parsed_files,
                 progress.cached_files,
                 progress.failed_files,
+                gpu_info.get("backend", "?"),
             )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             _log.exception("index %s failed", index_id)
