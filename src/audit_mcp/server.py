@@ -558,6 +558,49 @@ def attack_surface_diff(index_id_a: str, index_id_b: str) -> dict[str, Any]:
     return diff_attack_surface(engine_a, engine_b)
 
 
+# ---------------------------------------------------------------------------
+# Scale: partitioned indexing for large codebases (Chromium, Linux kernel)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def plan_partitions(path: str) -> dict[str, Any]:
+    """Analyze a codebase and produce a partition plan for large-scale indexing.
+
+    For codebases > 10K files (Chromium, Linux kernel, Android), single-graph
+    indexing fails (OOM, timeout). This tool splits the codebase into indexable
+    partitions by top-level directory. Each partition can be indexed separately.
+
+    Returns:
+      - Whether partitioning is needed
+      - List of partitions with file counts
+      - Which partitions are third-party (lower audit priority)
+      - Which directories were excluded (test, docs, build artifacts)
+    """
+    from audit_mcp.partitioner import Partitioner
+
+    planner = Partitioner()
+    plan = planner.plan(path)
+    return {
+        "status": "ready",
+        "root_path": plan.root_path,
+        "needs_partitioning": plan.needs_partitioning,
+        "reason": plan.reason,
+        "total_files": plan.total_files,
+        "total_partitions": plan.total_partitions,
+        "excluded_dirs": plan.excluded_dirs,
+        "partitions": [
+            {
+                "name": p.name,
+                "path": p.path,
+                "is_third_party": p.is_third_party,
+                "estimated_files": p.estimated_files,
+            }
+            for p in plan.partitions
+        ],
+    }
+
+
 def run_mcp() -> None:
     """Run the MCP server over stdio."""
     mcp.run()
