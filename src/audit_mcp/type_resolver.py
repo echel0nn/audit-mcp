@@ -138,6 +138,27 @@ class IncludeGraph:
         result.discard(self._normalize(file_path))
         return result
 
+    def includers_of(self, file_path: str, max_depth: int = 10) -> set[str]:
+        """Return all files that transitively include ``file_path``."""
+        target = self._normalize(file_path)
+        # Build reverse edges (who includes whom)
+        reverse: dict[str, list[str]] = {}
+        for src, dests in self._edges.items():
+            for dest in dests:
+                reverse.setdefault(dest, []).append(src)
+        result: set[str] = set()
+        stack = [(target, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > max_depth or current in result:
+                continue
+            result.add(current)
+            for inc in reverse.get(current, []):
+                if inc not in result:
+                    stack.append((inc, depth + 1))
+        result.discard(target)
+        return result
+
     def _parse_includes(self, file_path: str) -> None:
         """Extract #include "..." directives from a file."""
         norm = self._normalize(file_path)
@@ -228,6 +249,20 @@ class TypeTable:
     def lookup_function(self, name: str) -> list[FuncDef]:
         """Look up all definitions of a function by unqualified name."""
         return self.functions.get(name, [])
+
+    def children_of(self, class_name: str) -> list[str]:
+        """Return all classes that directly or transitively inherit from class_name."""
+        result: list[str] = []
+        stack = list(self.children.get(class_name, []))
+        visited: set[str] = set()
+        while stack:
+            cls = stack.pop()
+            if cls in visited:
+                continue
+            visited.add(cls)
+            result.append(cls)
+            stack.extend(self.children.get(cls, []))
+        return result
 
 
 class TypeResolver:

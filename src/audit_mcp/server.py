@@ -914,6 +914,91 @@ def search_narrowing_casts(index_id: str, pattern: str = "", limit: int = 50) ->
     results = searcher.search_narrowing_casts(pattern, limit=limit)
     return {"matches": [r.to_dict() for r in results], "count": len(results)}
 
+
+@mcp.tool()
+def extract_class(index_id: str, file_path: str, class_name: str) -> dict[str, Any]:
+    """Extract the full body of a class/struct from a source file.
+
+    Returns the complete class declaration with all members and methods.
+    Use when search_types finds a class and you need its full definition."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    result = searcher.extract_class(file_path, class_name)
+    if result is None:
+        return {"status": "error", "error": f"Class {class_name!r} not found in {file_path}"}
+    return result
+
+
+@mcp.tool()
+def read_function(index_id: str, file_path: str, function_name: str) -> dict[str, Any]:
+    """Extract the full body of a function/method from a source file.
+
+    Returns the complete function with all code. Use when callers_of or
+    search_functions finds a function and you need to read its logic."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    result = searcher.read_function(file_path, function_name)
+    if result is None:
+        return {"status": "error", "error": f"Function {function_name!r} not found in {file_path}"}
+    return result
+
+
+@mcp.tool()
+def cross_reference_bitfields(index_id: str) -> dict[str, Any]:
+    """Cross-reference BitField declarations against static_assert checks.
+
+    The core variant detection tool. For each BitField >= 10 bits, finds
+    the related kMax constant, checks if a static_assert connects them,
+    and computes the overflow margin. Returns findings sorted by risk."""
+    searcher = _searcher(index_id)
+    if searcher is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    findings = searcher.cross_reference_bitfields()
+    return {"findings": findings, "count": len(findings)}
+
+
+@mcp.tool()
+def children_of(index_id: str, class_name: str) -> dict[str, Any]:
+    """Find all classes that inherit from a given class (direct + transitive).
+
+    Uses the type resolver's inheritance graph. Requires index built with
+    type resolution enabled."""
+    from audit_mcp.type_resolver import TypeResolver
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    entry = index_manager._indexes.get(index_id)  # noqa: SLF001
+    if entry is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    resolver = TypeResolver(entry.root_path)
+    resolver.index()
+    children = resolver.type_table.children_of(class_name)
+    return {"class": class_name, "children": children, "count": len(children)}
+
+
+@mcp.tool()
+def includers_of(index_id: str, file_path: str) -> dict[str, Any]:
+    """Find all files that transitively include a given header.
+
+    Uses the include graph from the type resolver. Scopes the attack
+    surface — every file that includes a vulnerable header is affected."""
+    from audit_mcp.type_resolver import TypeResolver
+
+    entry = index_manager._indexes.get(index_id)  # noqa: SLF001
+    if entry is None:
+        return {"status": "error", "error": f"Unknown index: {index_id}"}
+    resolver = TypeResolver(entry.root_path)
+    resolver.index()
+    includers = resolver.include_graph.includers_of(file_path)
+    return {
+        "file": file_path,
+        "includers": sorted(includers),
+        "count": len(includers),
+    }
+
 def run_mcp() -> None:
     """Run the MCP server over stdio."""
     mcp.run()
