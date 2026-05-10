@@ -288,6 +288,93 @@ def findings(index_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# SARIF / weAudit augmentation
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def augment_sarif(index_id: str, sarif_path: str) -> dict[str, Any]:
+    """Import SARIF static analysis results and overlay findings on the code graph."""
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    return engine.augment_sarif(sarif_path)
+
+
+@mcp.tool()
+def augment_weaudit(index_id: str, weaudit_path: str) -> dict[str, Any]:
+    """Import weAudit audit annotations and overlay on the code graph."""
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    return engine.augment_weaudit(weaudit_path)
+
+
+# ---------------------------------------------------------------------------
+# Exception + annotation queries
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def functions_that_raise(index_id: str, exception_name: str) -> dict[str, Any]:
+    """Find all functions that raise/throw a specific exception type."""
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    results = engine.functions_that_raise(exception_name)
+    return {"exception": exception_name, "functions": results, "count": len(results)}
+
+
+@mcp.tool()
+def nodes_with_annotation(index_id: str, kind: str) -> dict[str, Any]:
+    """Find all nodes tagged with a specific annotation kind.
+
+    Valid kinds: finding, audit_note, blast_radius, privilege_boundary,
+    taint, entrypoint, sarif_finding, weaudit_finding.
+    """
+    from trailmark.models.annotations import AnnotationKind
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    kind_map = {k.value: k for k in AnnotationKind}
+    ak = kind_map.get(kind)
+    if ak is None:
+        return {"status": "error", "error": f"Unknown annotation kind: {kind!r}. Valid: {sorted(kind_map)}"}
+    results = engine.nodes_with_annotation(ak)
+    return {"kind": kind, "nodes": results, "count": len(results)}
+
+
+@mcp.tool()
+def clear_annotations(index_id: str, name: str, kind: str | None = None) -> dict[str, Any]:
+    """Remove annotations from a function, optionally filtered by kind."""
+    from trailmark.models.annotations import AnnotationKind
+
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    ak: AnnotationKind | None = None
+    if kind is not None:
+        kind_map = {k.value: k for k in AnnotationKind}
+        ak = kind_map.get(kind)
+        if ak is None:
+            return {"status": "error", "error": f"Unknown annotation kind: {kind!r}"}
+    ok = engine.clear_annotations(name, ak)
+    if not ok:
+        return {"status": "error", "error": f"Function {name!r} not found"}
+    return {"status": "ok", "cleared": name, "kind": kind}
+
+
+@mcp.tool()
+def export_graph(index_id: str) -> dict[str, Any]:
+    """Export the full code graph as JSON. Use for offline analysis or caching."""
+    engine, err = _require_engine(index_id)
+    if err:
+        return err
+    return engine.to_json()
+
+
+# ---------------------------------------------------------------------------
 # Language utilities (no index required)
 # ---------------------------------------------------------------------------
 
