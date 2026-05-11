@@ -999,6 +999,50 @@ def includers_of(index_id: str, file_path: str) -> dict[str, Any]:
         "count": len(includers),
     }
 
+
+
+# ---------------------------------------------------------------------------
+# Browser testing (headless Chrome/Firefox for PoC validation)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def test_in_browser(
+    html: str,
+    timeout_seconds: int = 30,
+    browser: str = "auto",
+) -> dict[str, Any]:
+    """Execute HTML/JS in headless Chrome or Firefox and return results.
+
+    Serves the HTML via a local HTTP server with COOP/COEP headers
+    (for SharedArrayBuffer support). Captures console.log output,
+    detects crashes (STATUS_BREAKPOINT, ACCESS_VIOLATION, SIGABRT),
+    and reports timing.
+
+    ``browser``: ``"chrome"``, ``"firefox"``, or ``"auto"`` (try Chrome first).
+
+    Returns: console lines, errors, crash status, exit code, elapsed time.
+    """
+    from audit_mcp.browser_test import BrowserTestRunner
+
+    runner = BrowserTestRunner(browser=browser)
+    if not runner.available():
+        return {"status": "error", "error": "No browser found", **runner.info()}
+    result = runner.run(html, timeout_seconds=timeout_seconds, browser=browser)
+    return result.to_dict()
+
+
+@mcp.tool()
+def browser_info() -> dict[str, Any]:
+    """Check which browsers are available for test_in_browser."""
+    from audit_mcp.browser_test import BrowserTestRunner
+
+    chrome = BrowserTestRunner(browser="chrome")
+    firefox = BrowserTestRunner(browser="firefox")
+    return {
+        "chrome": chrome.info(),
+        "firefox": firefox.info(),
+    }
 def run_mcp() -> None:
     """Run the MCP server over stdio."""
     mcp.run()
