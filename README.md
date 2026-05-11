@@ -172,22 +172,25 @@ attack_surface_diff(index_id_a="v1", index_id_b="v2")
 
 "This PR added 3 new entrypoints and removed a validation check. Attack surface grew by 8%." That's the kind of sentence that makes security reviews actually useful instead of just theater.
 
-## The Full Arsenal (41 Tools)
+## The Full Arsenal (51 Tools)
 
 | Category | Tools | What They Do |
 |---|---|---|
 | **Index lifecycle** | `index_codebase`, `poll_index`, `list_indexes` | Parse + analyze codebases |
-| **Graph queries** | `callers_of`, `callees_of`, `ancestors_of`, `reachable_from`, `paths_between`, `search_functions` | Navigate the call graph (GPU-accelerated) |
+| **Graph queries** | `callers_of`, `callees_of`, `ancestors_of`, `reachable_from`, `paths_between`, `search_functions` | Navigate the call graph (GPU-accelerated, bounded) |
 | **Security analysis** | `attack_surface`, `preanalysis`, `complexity_hotspots`, `entrypoint_paths_to`, `taint_paths_to` | Map attack surface + taint |
-| **Deep audit** | `dead_code`, `unreachable_from_entrypoints`, `fuzzing_targets` | Graph-aware security analysis (GPU-accelerated) |
-| **Scanners** | `list_scanners`, `run_scanner`, `scan_and_correlate`, `augment_sarif` | Run SAST tools + correlate |
+| **Deep audit** | `dead_code`, `unreachable_from_entrypoints`, `fuzzing_targets` | Graph-aware security analysis (GPU-accelerated, async) |
+| **Source search** | `search_constants`, `search_types`, `search_assertions`, `search_bitfields`, `search_macros`, `search_source`, `search_narrowing_casts` | Find constants, types, assertions, bitfields, macros — constructs outside the call graph |
+| **Code reading** | `extract_class`, `read_function` | Extract full class/function bodies from source |
+| **Variant hunting** | `cross_reference_bitfields`, `children_of`, `includers_of` | Cross-reference bitfield widths vs capacity checks, trace inheritance, map include graphs |
+| **Scanners** | `list_scanners`, `run_scanner`, `scan_and_correlate`, `augment_sarif` | Run SAST tools + correlate with graph |
 | **Annotations** | `annotate_function`, `annotations_of`, `findings`, `clear_annotations`, `nodes_with_annotation`, `functions_that_raise` | Tag + query findings |
 | **Diffing** | `diff_codebases`, `attack_surface_diff` | Version comparison |
-| **Scale** | `plan_partitions`, `export_graph`, `cache_stats`, `clear_cache`, `memory_usage` | Large codebase support |
+| **Scale** | `plan_partitions`, `export_graph`, `cache_stats`, `clear_cache`, `memory_usage` | Large codebase support + LRU eviction |
 | **Async** | `poll_task`, `list_tasks` | Background task management |
 | **Utilities** | `supported_languages`, `detect_languages` | Language detection |
 
-41 tools. Every single one returns structured JSON. No parsing stdout like it's 2003.
+51 tools. Every single one returns structured JSON. No parsing stdout like it's 2003.
 
 ## GPU Acceleration
 
@@ -312,18 +315,22 @@ Source code (21 languages)
     |                              +------+------+
     |                                     |
     v                                     v
-[server.py] -- 41 MCP tools ------------->  results
+[server.py] -- 51 MCP tools ------------->  results
     |
     +-- callers_of, ancestors_of, reachable_from  --> gpu_graph BFS
     +-- dead_code, unreachable_from_entrypoints   --> gpu_graph batched BFS
     +-- blast_radius_top_n                        --> gpu_graph batched SpMV
     +-- hub_names                                 --> gpu_graph in-degree array
+    +-- search_constants, search_bitfields, ...   --> source_search (regex over source)
+    +-- extract_class, read_function              --> source_search (brace-matched extraction)
+    +-- cross_reference_bitfields                 --> source_search (automated variant detection)
+    +-- children_of, includers_of                 --> type_resolver (inheritance + include graph)
     +-- scan_and_correlate, augment_sarif         --> trailmark engine
     +-- annotate_function, findings               --> trailmark engine
     +-- search_functions, paths_between           --> query_bounds (bounded)
 ```
 
-Trailmark owns parsing and modeling. The GPU engine owns traversal. The server owns the MCP tool surface. Clean boundaries, no coupling.
+Trailmark owns parsing and modeling. The GPU engine owns traversal. Source search owns constants/types/assertions. The type resolver owns cross-file C++ resolution. The server owns the MCP tool surface. Clean boundaries, no coupling.
 
 ## Development
 
