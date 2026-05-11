@@ -1043,6 +1043,29 @@ def browser_info() -> dict[str, Any]:
         "chrome": chrome.info(),
         "firefox": firefox.info(),
     }
+
+
+@mcp.tool()
+def fuzz_generators(
+    iterations: int = 50,
+    timeout_per_test: int = 15,
+    seed: int | None = None,
+    browser: str = "auto",
+) -> dict[str, Any]:
+    """Fuzz async/sync generator edge cases in headless browser.
+
+    Generates randomized generator functions varying yield* count,
+    iterator overrides, .done getters, try/finally, queue flooding,
+    TypedArray interactions, and cross-delegation patterns.
+
+    Returns crash count, interesting findings, and timing."""
+    from audit_mcp.generator_fuzzer import GeneratorFuzzer
+
+    fuzzer = GeneratorFuzzer(browser=browser, seed=seed)
+    if not fuzzer.available():
+        return {"status": "error", "error": "No browser available"}
+    result = fuzzer.fuzz(iterations=iterations, timeout_per_test=timeout_per_test)
+    return result.to_dict()
 def run_mcp() -> None:
     """Run the MCP server over stdio."""
     mcp.run()
