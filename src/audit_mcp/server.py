@@ -17,7 +17,10 @@ transport so callers see one cache across both.
 from __future__ import annotations
 
 import logging
+import os
+import re
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -106,6 +109,90 @@ def _bounded_envelope(result: BoundedResult, key: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Index lifecycle
 # ---------------------------------------------------------------------------
+
+
+_CLONE_DIR_DEFAULT = Path.home() / ".cache" / "audit-mcp" / "clones"
+_CLONE_TIMEOUT_SECONDS = 600
+_SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _clone_dir() -> Path:
+    root = Path(os.environ.get("AUDIT_MCP_CLONE_DIR") or _CLONE_DIR_DEFAULT)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _repo_slug(repo_url: str, ref: str | None) -> str:
+    base = repo_url
+    for prefix in ("https://", "http://", "git@", "ssh://"):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    base = base.replace(":", "/").rstrip("/")
+    if base.endswith(".git"):
+        base = base[:-4]
+    slug = _SAFE_NAME_RE.sub("_", base.replace("/", "_"))
+    suffix = _SAFE_NAME_RE.sub("_", ref) if ref else "HEAD"
+    return f"{slug}@{suffix}"
+
+
+@mcp.tool()
+def clone_repo(repo_url: str, ref: str = "") -> dict[str, Any]:
+    """Shallow-clone ``repo_url`` into the MCP server's clone cache.
+
+    The server owns the working tree — callers pass the returned ``path``
+    straight into :func:`index_codebase`. Re-cloning the same (repo, ref)
+    pair is idempotent: it does ``git fetch + checkout`` on the existing
+    checkout instead of a fresh clone.
+
+    Returns ``{"status": "ready", "path": "...", "repo_url": "...",
+    "ref": "..."}`` on success, or ``{"status": "error", "error": "..."}``.
+    Clone root defaults to ``~/.cache/audit-mcp/clones`` and is overridable
+    via the ``AUDIT_MCP_CLONE_DIR`` env var.
+    """
+    import shutil
+    import subprocess
+
+    if not repo_url:
+        return {"status": "error", "error": "repo_url required"}
+    if not shutil.which("git"):
+        return {"status": "error", "error": "git is not installed on the MCP server"}
+
+    ref_clean = ref.strip() or None
+    dest = _clone_dir() / _repo_slug(repo_url, ref_clean)
+
+    try:
+        if (dest / ".git").exists():
+            subprocess.run(  # noqa: S603
+                ["git", "-C", str(dest), "fetch", "--depth", "1", "origin", ref_clean or "HEAD"],
+                capture_output=True, check=True, timeout=_CLONE_TIMEOUT_SECONDS,
+            )
+            if ref_clean:
+                subprocess.run(  # noqa: S603
+                    ["git", "-C", str(dest), "checkout", "FETCH_HEAD"],
+                    capture_output=True, check=True, timeout=_CLONE_TIMEOUT_SECONDS,
+                )
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            cmd = ["git", "clone", "--depth", "1"]
+            if ref_clean:
+                cmd += ["--branch", ref_clean]
+            cmd += [repo_url, str(dest)]
+            subprocess.run(  # noqa: S603
+                cmd, capture_output=True, check=True, timeout=_CLONE_TIMEOUT_SECONDS,
+            )
+    except subprocess.CalledProcessError as exc:
+        err = (exc.stderr or b"").decode(errors="replace").strip()[:400]
+        return {"status": "error", "error": f"git failed (exit {exc.returncode}): {err}"}
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": f"git timed out after {_CLONE_TIMEOUT_SECONDS}s"}
+
+    return {
+        "status": "ready",
+        "path": str(dest),
+        "repo_url": repo_url,
+        "ref": ref_clean or "HEAD",
+    }
 
 
 @mcp.tool()
