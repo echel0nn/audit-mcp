@@ -601,7 +601,8 @@ def scan_and_correlate(index_id: str, scanner: str, timeout_seconds: int = 600) 
 
 
 @mcp.tool()
-def functions_that_raise(index_id: str, exception_name: str) -> dict[str, Any]:
+def functions_that_raise(index_id: str, name: str) -> dict[str, Any]:
+    exception_name = name
     """Find all functions that raise/throw a specific exception type."""
     engine, err = _require_engine(index_id)
     if err:
@@ -756,7 +757,8 @@ def unreachable_from_entrypoints(index_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def taint_paths_to(index_id: str, sink_name: str, max_depth: int = 20) -> dict[str, Any]:
+def taint_paths_to(index_id: str, name: str, max_depth: int = 20) -> dict[str, Any]:
+    sink_name = name
     """Find all entrypoint-to-sink call paths for a dangerous function.
 
     Answers: 'Is this eval/exec/SQL query reachable from the network?'
@@ -1003,7 +1005,8 @@ def search_narrowing_casts(index_id: str, pattern: str = "", limit: int = 50) ->
 
 
 @mcp.tool()
-def extract_class(index_id: str, file_path: str, class_name: str) -> dict[str, Any]:
+def extract_class(index_id: str, file_path: str, name: str) -> dict[str, Any]:
+    class_name = name
     """Extract the full body of a class/struct from a source file.
 
     Returns the complete class declaration with all members and methods.
@@ -1018,7 +1021,8 @@ def extract_class(index_id: str, file_path: str, class_name: str) -> dict[str, A
 
 
 @mcp.tool()
-def read_function(index_id: str, file_path: str, function_name: str) -> dict[str, Any]:
+def read_function(index_id: str, file_path: str, name: str) -> dict[str, Any]:
+    function_name = name
     """Extract the full body of a function/method from a source file.
 
     Returns the complete function with all code. Use when callers_of or
@@ -1047,7 +1051,8 @@ def cross_reference_bitfields(index_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def children_of(index_id: str, class_name: str) -> dict[str, Any]:
+def children_of(index_id: str, name: str) -> dict[str, Any]:
+    class_name = name
     """Find all classes that inherit from a given class (direct + transitive).
 
     Uses the type resolver's inheritance graph. Requires index built with
