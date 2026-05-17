@@ -70,6 +70,26 @@ class SourceSearcher:
         self._root = Path(root).resolve()
         self._files: list[str] | None = None
 
+    def _resolve_path(self, file_path: str) -> str | None:
+        """Resolve an agent-supplied path (forward-slash, repo-relative)
+        against the source file list. The previous implementation did
+        ``file_path in fp`` on raw strings — broken on Windows where
+        ``fp`` uses backslashes and the agent's ``file_path`` uses
+        forward slashes, so the substring check never matched.
+
+        We normalize both sides to forward slashes before comparing.
+        Suffix-match wins over basename-match so a path that explicitly
+        names a subdirectory (``src/http/ngx_http_script.c``) doesn't
+        accidentally pick a same-named file in a different subtree.
+        """
+        needle = file_path.replace("\\", "/")
+        basename = os.path.basename(needle)
+        for fp in self._source_files():
+            haystack = fp.replace("\\", "/")
+            if haystack.endswith(needle) or os.path.basename(haystack) == basename:
+                return fp
+        return None
+
     def _source_files(self) -> list[str]:
         if self._files is not None:
             return self._files
@@ -345,87 +365,110 @@ class SourceSearcher:
         """Extract the full body of a class/struct from a source file.
 
         Returns the class declaration, members, methods, and inheritance.
+        Same multi-line lookup pattern as ``read_function`` — single-line
+        regex scanning silently failed on definitions like
+        ``class Foo\n    : public Bar {`` where the brace lives several
+        lines below the class keyword.
         """
-        full_path = None
-        for fp in self._source_files():
-            if file_path in fp or os.path.basename(fp) == file_path:
-                full_path = fp
-                break
+        full_path = self._resolve_path(file_path)
         if full_path is None:
             return None
         lines = self._read_file_lines(full_path)
         if lines is None:
             return None
+        source = "\n".join(lines)
+        # Match the class keyword + name + optional base-class clause
+        # (everything up to the opening brace). DOTALL so the base-class
+        # clause may span multiple lines.
         class_re = re.compile(
-            rf'(?:class|struct)\s+(?:__attribute__\s*\(\([^)]*\)\)\s*)?{re.escape(class_name)}\b'
+            rf'(?:class|struct)\s+(?:__attribute__\s*\(\([^)]*\)\)\s*)?'
+            rf'{re.escape(class_name)}\b[^;{{]*?\{{',
+            re.DOTALL,
         )
-        for i, line in enumerate(lines):
-            if not class_re.search(line):
-                continue
-            # Found the class declaration — extract body by brace matching
-            start_line = i
-            brace_count = 0
-            started = False
-            body_lines: list[str] = []
-            for j in range(i, min(len(lines), i + 2000)):
-                body_lines.append(lines[j].rstrip())
-                brace_count += lines[j].count("{") - lines[j].count("}")
-                if "{" in lines[j]:
-                    started = True
-                if started and brace_count <= 0:
-                    break
-            return {
-                "file": os.path.basename(full_path),
-                "file_path": full_path,
-                "class_name": class_name,
-                "start_line": start_line + 1,
-                "end_line": start_line + len(body_lines),
-                "line_count": len(body_lines),
-                "body": body_lines,
-            }
-        return None
+        match = class_re.search(source)
+        if match is None:
+            return None
+        start_offset = match.start()
+        start_line = source.count("\n", 0, start_offset)
+        brace_count = 0
+        started = False
+        body_lines: list[str] = []
+        for j in range(start_line, min(len(lines), start_line + 2000)):
+            body_lines.append(lines[j].rstrip())
+            brace_count += lines[j].count("{") - lines[j].count("}")
+            if "{" in lines[j]:
+                started = True
+            if started and brace_count <= 0:
+                break
+        return {
+            "file": os.path.basename(full_path),
+            "file_path": full_path,
+            "class_name": class_name,
+            "start_line": start_line + 1,
+            "end_line": start_line + len(body_lines),
+            "line_count": len(body_lines),
+            "body": body_lines,
+        }
 
     def read_function(
         self, file_path: str, function_name: str,
     ) -> dict[str, Any] | None:
-        """Extract the full body of a function/method from a source file."""
-        full_path = None
-        for fp in self._source_files():
-            if file_path in fp or os.path.basename(fp) == file_path:
-                full_path = fp
-                break
+        """Extract the full body of a function/method from a source file.
+
+        Handles both K&R/nginx-style multi-line definitions (return type
+        on its own line, body brace on the line after the parameter
+        list) and single-line definitions. The prior implementation
+        searched per-line for ``name(...){`` which silently failed for
+        every nginx-style definition where the ``{`` lives on a
+        separate line. We now scan the file as one text region with a
+        multi-line regex, then walk back to the line containing the
+        signature and walk forward by brace counting.
+        """
+        full_path = self._resolve_path(file_path)
         if full_path is None:
             return None
         lines = self._read_file_lines(full_path)
         if lines is None:
             return None
-        func_re = re.compile(
-            rf'\b{re.escape(function_name)}\s*\([^;]*\)\s*(?:const\s*)?(?:override\s*)?(?:final\s*)?\{{'
+        # Join with explicit \n so byte offsets map back to (line, col)
+        # via cumulative length lookup. We keep the original lines list
+        # for the body extraction step.
+        source = "\n".join(lines)
+        # Signature regex spans newlines: name + paren block (which
+        # may contain newlines) + optional const/override/final + {.
+        # ``[^;]*`` deliberately rejects forward declarations (``);``).
+        # We use DOTALL so ``.`` matches newlines inside the param list.
+        sig_re = re.compile(
+            rf'\b{re.escape(function_name)}\s*\([^;]*?\)\s*'
+            rf'(?:const\s*)?(?:override\s*)?(?:final\s*)?\{{',
+            re.DOTALL,
         )
-        for i, line in enumerate(lines):
-            if not func_re.search(line):
-                continue
-            start_line = i
-            brace_count = 0
-            started = False
-            body_lines: list[str] = []
-            for j in range(i, min(len(lines), i + 5000)):
-                body_lines.append(lines[j].rstrip())
-                brace_count += lines[j].count("{") - lines[j].count("}")
-                if "{" in lines[j]:
-                    started = True
-                if started and brace_count <= 0:
-                    break
-            return {
-                "file": os.path.basename(full_path),
-                "file_path": full_path,
-                "function_name": function_name,
-                "start_line": start_line + 1,
-                "end_line": start_line + len(body_lines),
-                "line_count": len(body_lines),
-                "body": body_lines,
-            }
-        return None
+        match = sig_re.search(source)
+        if match is None:
+            return None
+        # Map the match start byte offset to a 0-based line index.
+        start_offset = match.start()
+        start_line = source.count("\n", 0, start_offset)
+        # Walk forward by brace counting from the signature line.
+        brace_count = 0
+        started = False
+        body_lines: list[str] = []
+        for j in range(start_line, min(len(lines), start_line + 5000)):
+            body_lines.append(lines[j].rstrip())
+            brace_count += lines[j].count("{") - lines[j].count("}")
+            if "{" in lines[j]:
+                started = True
+            if started and brace_count <= 0:
+                break
+        return {
+            "file": os.path.basename(full_path),
+            "file_path": full_path,
+            "function_name": function_name,
+            "start_line": start_line + 1,
+            "end_line": start_line + len(body_lines),
+            "line_count": len(body_lines),
+            "body": body_lines,
+        }
 
     def cross_reference_bitfields(self) -> list[dict[str, Any]]:
         """Cross-reference BitField declarations against static_assert capacity checks.
