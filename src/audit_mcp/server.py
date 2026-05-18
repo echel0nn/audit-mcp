@@ -1025,15 +1025,58 @@ def read_function(index_id: str, file_path: str, name: str) -> dict[str, Any]:
     function_name = name
     """Extract the full body of a function/method from a source file.
 
-    Returns the complete function with all code. Use when callers_of or
-    search_functions finds a function and you need to read its logic."""
+    AST-only — uses the TypeResolver function index to land on the
+    exact definition (file + line). No regex grep, no call-site /
+    definition ambiguity. ``file_path`` is a disambiguation hint
+    when a name has multiple definitions across the tree; pass the
+    exact path from search_functions to pick a specific one.
+    """
+    from audit_mcp.type_resolver import TypeResolver
+
     searcher = _searcher(index_id)
     if searcher is None:
         return {"status": "error", "error": f"Unknown index: {index_id}"}
-    result = searcher.read_function(file_path, function_name)
-    if result is None:
-        return {"status": "error", "error": f"Function {function_name!r} not found in {file_path}"}
-    return result
+
+    entry = index_manager._indexes.get(index_id)  # noqa: SLF001
+    if entry is None:
+        return {"status": "error", "error": f"Index {index_id!r} has no root path"}
+
+    resolver = TypeResolver(entry.root_path)
+    resolver.index()
+    candidates = resolver.type_table.lookup_function(function_name)
+    if not candidates:
+        return {
+            "status": "error",
+            "error": f"Function {function_name!r} not indexed. Try search_functions to find the exact name.",
+        }
+
+    # When multiple definitions exist (overloads, statics in different
+    # files), prefer the one whose file_path matches the supplied
+    # ``file_path`` hint. Otherwise return the first — TypeResolver
+    # emits in source-order so the canonical definition wins over
+    # forward declarations.
+    chosen = None
+    if file_path:
+        needle = file_path.replace("\\", "/")
+        for c in candidates:
+            if needle in c.file_path.replace("\\", "/"):
+                chosen = c
+                break
+    if chosen is None:
+        chosen = candidates[0]
+
+    extracted = searcher.read_function_at(chosen.file_path, chosen.line, function_name)
+    if extracted is None:
+        return {
+            "status": "error",
+            "error": f"Indexed location for {function_name!r} unreadable: {chosen.file_path}:{chosen.line}",
+        }
+    if len(candidates) > 1:
+        extracted["other_definitions"] = [
+            {"file_path": c.file_path, "line": c.line, "qualified_name": c.qualified_name}
+            for c in candidates if c is not chosen
+        ]
+    return extracted
 
 
 @mcp.tool()

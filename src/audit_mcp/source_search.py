@@ -434,14 +434,20 @@ class SourceSearcher:
         # via cumulative length lookup. We keep the original lines list
         # for the body extraction step.
         source = "\n".join(lines)
-        # Signature regex spans newlines: name + paren block (which
-        # may contain newlines) + optional const/override/final + {.
-        # ``[^;]*`` deliberately rejects forward declarations (``);``).
-        # We use DOTALL so ``.`` matches newlines inside the param list.
+        # Signature regex anchored to LINE START so it matches function
+        # definitions, not call sites. A definition looks like
+        # ``name(args) {`` with the name as the first non-whitespace
+        # token on its line. A call site like
+        # ``if (name(sc) != NGX_OK) {`` has ``if (`` before the name
+        # and matched first under the old un-anchored regex, returning
+        # the call's 3-line body instead of the real function body.
+        #
+        # ``[^;]*`` rejects forward declarations (``);``). MULTILINE
+        # makes ``^`` match the start of any line, not just the file.
         sig_re = re.compile(
-            rf'\b{re.escape(function_name)}\s*\([^;]*?\)\s*'
+            rf'^[ \t]*\b{re.escape(function_name)}\s*\([^;]*?\)\s*'
             rf'(?:const\s*)?(?:override\s*)?(?:final\s*)?\{{',
-            re.DOTALL,
+            re.MULTILINE,
         )
         match = sig_re.search(source)
         if match is None:
@@ -466,6 +472,43 @@ class SourceSearcher:
             "function_name": function_name,
             "start_line": start_line + 1,
             "end_line": start_line + len(body_lines),
+            "line_count": len(body_lines),
+            "body": body_lines,
+        }
+
+    def read_function_at(
+        self, file_path: str, start_line: int, function_name: str,
+    ) -> dict[str, Any] | None:
+        """Extract a function body starting at a KNOWN line number.
+
+        Used when an AST index has already pinpointed the definition
+        location — no regex search, no call-site / definition
+        ambiguity. Walks forward from ``start_line`` (1-based, as
+        TypeResolver emits) counting braces until the function closes.
+        Same return shape as ``read_function``.
+        """
+        if not file_path or start_line < 1:
+            return None
+        lines = self._read_file_lines(file_path)
+        if lines is None or start_line > len(lines):
+            return None
+        zero_based = start_line - 1
+        brace_count = 0
+        started = False
+        body_lines: list[str] = []
+        for j in range(zero_based, min(len(lines), zero_based + 5000)):
+            body_lines.append(lines[j].rstrip())
+            brace_count += lines[j].count("{") - lines[j].count("}")
+            if "{" in lines[j]:
+                started = True
+            if started and brace_count <= 0:
+                break
+        return {
+            "file": os.path.basename(file_path),
+            "file_path": file_path,
+            "function_name": function_name,
+            "start_line": start_line,
+            "end_line": start_line + len(body_lines) - 1,
             "line_count": len(body_lines),
             "body": body_lines,
         }
