@@ -10,3 +10,9 @@ build/
 .mypy_cache/
 *.i64
 *.idb
+
+# Operator-machine artifacts — local logs, screenshots, tour scripts
+.audit*
+.logs/
+*.log
+*.pid
