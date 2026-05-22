@@ -782,7 +782,7 @@ def fuzzing_targets(index_id: str, min_complexity: int = 10, limit: int = 20) ->
     engine, err = _require_engine(index_id)
     if err:
         return err
-    return suggest_fuzzing_targets(engine, min_complexity, limit)
+    return suggest_fuzzing_targets(engine, _gpu(index_id), min_complexity, limit)
 
 
 @mcp.tool()

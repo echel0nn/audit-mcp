@@ -150,16 +150,38 @@ class IndexManager:
         return engine
 
     def get_gpu_engine(self, index_id: str) -> Any:
-        """Return the GpuGraphEngine if available, else None.
+        """Return the GpuGraphEngine, building it lazily if needed.
 
-        Does NOT trigger disk reload — the GPU engine is only available
-        if the index was built in this process (not recovered from disk).
+        Indexes recovered from the durable store on process restart
+        come back with ``entry.gpu_engine = None`` because the GPU
+        engine isn't persisted (it's a derived CSR + CuPy state).
+        On first ``get_gpu_engine`` after such a recovery, rebuild
+        the GPU engine from the CPU engine's call graph — costs one
+        ``from_trailmark(engine)`` invocation (a few seconds even on
+        monorepo-scale graphs because it's a single CSR build, not a
+        re-index). Subsequent calls hit the cached engine.
         """
+        from audit_mcp.gpu_graph import from_trailmark  # noqa: PLC0415
+
         with self._lock:
             entry = self._indexes.get(index_id)
             if entry is None or entry.status != "ready":
                 return None
-            return entry.gpu_engine
+            if entry.gpu_engine is not None:
+                return entry.gpu_engine
+            cpu_engine = entry.engine
+        if cpu_engine is None:
+            # CPU engine evicted under LRU — trigger reload via get_engine
+            # which knows how to pull from the disk store.
+            cpu_engine = self.get_engine(index_id)
+            if cpu_engine is None:
+                return None
+        gpu_engine = from_trailmark(cpu_engine)
+        with self._lock:
+            entry_again = self._indexes.get(index_id)
+            if entry_again is not None:
+                entry_again.gpu_engine = gpu_engine
+        return gpu_engine
 
     def list_indexes(self) -> list[dict[str, Any]]:
         """Return a snapshot of every index entry."""
