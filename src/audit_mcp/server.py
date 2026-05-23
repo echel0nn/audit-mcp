@@ -1260,23 +1260,36 @@ def semantic_search(
     index_id: str,
     query: str,
     top_k: int = 10,
+    alpha: float | None = None,
+    rerank: bool = True,
     filter_languages: list[str] | None = None,
     filter_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Natural-language / hybrid code search via semble (Model2Vec + BM25 + RRF).
 
-    Returns the top-k code chunks semantically + lexically matching the query.
-    Each chunk is a code-aware tree-sitter slice (function/class/block) — not a
-    file:line snippet — so the agent gets enough context in one shot to decide
-    whether to drill in.
+    Returns the top-k code chunks semantically + lexically matching the
+    query. Each chunk is a code-aware tree-sitter slice — not a file:line
+    snippet — so the agent gets enough context in one shot.
 
-    Use this for "find code that does X" / "where is Y handled" queries where
-    regex (search_source) would require guessing the right keyword. Use
-    callers_of / taint_paths_to / read_function for graph-aware drill-in once
-    you have a candidate.
+    Parameters:
+      query: natural language ("how is HTTP/2 framed") OR identifier
+        ("ngx_http_v2_parse"). Both work; the reranker auto-adapts.
+      top_k: max chunks to return (default 10).
+      alpha: 0.0..1.0 — bias toward BM25 (1.0) or embedding (0.0). None
+        = adaptive (recommended). Use >=0.8 for exact-identifier
+        queries; <=0.3 for pure semantic intent.
+      rerank: enable code-aware reranking (definition boost, identifier
+        stems, file coherence, noise penalty). Off = ~30% faster but
+        misses canonical-definition prioritization.
+      filter_languages: restrict results to e.g. ["c", "cpp"].
+      filter_paths: restrict to specific file paths.
 
-    Cold first-call builds the semble index lazily (~250 ms for nginx, ~13 s
-    for firefox); subsequent calls are <5 ms.
+    Use this for "find code that does X" / "where is Y handled". Use
+    callers_of / taint_paths_to / read_function for graph-aware drill-in.
+
+    Cold first-call builds the semble index lazily (~250 ms nginx /
+    ~13 s firefox); warm queries are ~200 ms through MCP HTTP (~5 ms
+    in-process).
     """
     sidx = index_manager.get_semble_index(index_id)
     if sidx is None:
@@ -1288,12 +1301,15 @@ def semantic_search(
             ),
         }
     try:
-        results = sidx.search(
-            query,
-            top_k=top_k,
-            filter_languages=filter_languages,
-            filter_paths=filter_paths,
-        )
+        kwargs: dict[str, Any] = {
+            "top_k": top_k,
+            "rerank": rerank,
+            "filter_languages": filter_languages,
+            "filter_paths": filter_paths,
+        }
+        if alpha is not None:
+            kwargs["alpha"] = alpha
+        results = sidx.search(query, **kwargs)
     except (ValueError, RuntimeError) as exc:
         return {"status": "error", "error": f"semble.search failed: {exc}"}
     chunks = []
@@ -1312,6 +1328,8 @@ def semantic_search(
         "query": query,
         "results": chunks,
         "count": len(chunks),
+        "alpha": alpha,
+        "rerank": rerank,
     }
 
 
@@ -1386,6 +1404,44 @@ def find_related(
         "results": chunks,
         "count": len(chunks),
     }
+
+
+@mcp.tool()
+def semble_stats(index_id: str) -> dict[str, Any]:
+    """Return semble index statistics for ``index_id``.
+
+    Useful for observability — how many chunks, total bytes indexed,
+    languages present, average chunk size. Triggers a lazy semble
+    build if the index hasn't been queried yet.
+    """
+    sidx = index_manager.get_semble_index(index_id)
+    if sidx is None:
+        return {
+            "status": "error",
+            "error": f"semble index for {index_id!r} unavailable",
+        }
+    try:
+        s = sidx.stats()
+    except (AttributeError, RuntimeError) as exc:
+        return {"status": "error", "error": f"semble.stats() failed: {exc}"}
+    # IndexStats dataclass → dict; field set varies by semble version
+    # so we pull known attrs defensively and fall through to repr.
+    out: dict[str, Any] = {"status": "ready"}
+    for field in (
+        "chunks", "files", "bytes", "languages", "avg_chunk_size",
+        "embedding_dim", "vocab_size", "build_time_ms",
+    ):
+        if hasattr(s, field):
+            v = getattr(s, field)
+            try:
+                out[field] = (
+                    list(v) if isinstance(v, (set, tuple)) else v
+                )
+            except (TypeError, ValueError):
+                out[field] = repr(v)
+    if len(out) == 1:  # nothing matched the known field set
+        out["raw"] = repr(s)
+    return out
 
 
 def run_mcp() -> None:
