@@ -110,9 +110,43 @@ def run_http(host: str | None = None, port: int | None = None) -> None:
 
     Host/port may be overridden via env vars ``AUDIT_MCP_HTTP_HOST``
     (default ``127.0.0.1``) and ``AUDIT_MCP_HTTP_PORT`` (default ``18822``).
+
+    Worker count is controlled by ``AUDIT_MCP_WORKERS`` (default 1).
+    When >1, each worker is a separate Python process with its own
+    GIL — slow CPU-bound calls in one worker (e.g. read_function on
+    a giant firefox function) no longer block other workers from
+    serving requests. Trade-off: every worker maintains its own
+    in-memory caches (TypeResolver, semble index, GPU CSR) so peak
+    RAM scales linearly with worker count, and the first call to
+    each worker pays the cold-build cost independently.
+
+    AILA's AuditMcpBridgeTool addresses the cold-build issue by
+    issuing a parallel pre-warm fan-out on the first call to a new
+    index_id, so all workers warm together rather than serially as
+    requests trickle in.
     """
     import uvicorn  # local import: stdio path doesn't need uvicorn loaded
 
     resolved_host = host or os.environ.get("AUDIT_MCP_HTTP_HOST", "127.0.0.1")
     resolved_port = port or int(os.environ.get("AUDIT_MCP_HTTP_PORT", "18822"))
-    uvicorn.run(create_app(), host=resolved_host, port=resolved_port, log_level="info")
+    workers = int(os.environ.get("AUDIT_MCP_WORKERS", "1"))
+    if workers > 1:
+        # Multi-worker: uvicorn requires a string import path + factory
+        # flag so each worker process can re-import + call create_app.
+        uvicorn.run(
+            "audit_mcp.http_api:create_app",
+            factory=True,
+            host=resolved_host,
+            port=resolved_port,
+            workers=workers,
+            log_level="info",
+        )
+    else:
+        # Single worker: passing the app instance directly avoids the
+        # import-path overhead and works for stdio + dev setups.
+        uvicorn.run(
+            create_app(),
+            host=resolved_host,
+            port=resolved_port,
+            log_level="info",
+        )
