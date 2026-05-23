@@ -30,8 +30,11 @@ _TOOL_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 
+_TOOL_INDEX_CACHE: dict[str, Any] | None = None
+
+
 def _tool_index() -> dict[str, Any]:
-    """Build a name->tool dict from FastMCP's local provider.
+    """Build a name->tool dict from FastMCP's local provider, cached.
 
     Loop-aware: in single-worker mode uvicorn loads the app BEFORE
     starting its event loop, so ``asyncio.run`` works. In multi-worker
@@ -39,7 +42,17 @@ def _tool_index() -> dict[str, Any]:
     INSIDE its event loop — ``asyncio.run`` raises
     ``RuntimeError: cannot be called from a running event loop``.
     Fall through to a worker thread in that case.
+
+    The result is cached at module level after first build — tool
+    decorators register at import time so the tool set never changes
+    after that. /health and /tools used to pay the asyncio dance on
+    every request (~670ms per /health on a multi-worker setup); now
+    they're a dict lookup.
     """
+    global _TOOL_INDEX_CACHE
+    if _TOOL_INDEX_CACHE is not None:
+        return _TOOL_INDEX_CACHE
+
     import asyncio
     import concurrent.futures
 
@@ -56,7 +69,8 @@ def _tool_index() -> dict[str, Any]:
             ).result()
     else:
         tools = asyncio.run(mcp._local_provider.list_tools())
-    return {t.name: t for t in tools}
+    _TOOL_INDEX_CACHE = {t.name: t for t in tools}
+    return _TOOL_INDEX_CACHE
 
 def _make_handler(fn: Callable[..., Any], tool_name: str) -> Callable[..., Any]:
     """Build a FastAPI POST handler that proxies a single tool function."""
@@ -126,7 +140,11 @@ def create_app() -> FastAPI:
     return app
 
 
-def run_http(host: str | None = None, port: int | None = None) -> None:
+def run_http(
+    host: str | None = None,
+    port: int | None = None,
+    workers: int | None = None,
+) -> None:
     """Run the HTTP API server with uvicorn.
 
     Host/port may be overridden via env vars ``AUDIT_MCP_HTTP_HOST``
@@ -150,7 +168,8 @@ def run_http(host: str | None = None, port: int | None = None) -> None:
 
     resolved_host = host or os.environ.get("AUDIT_MCP_HTTP_HOST", "127.0.0.1")
     resolved_port = port or int(os.environ.get("AUDIT_MCP_HTTP_PORT", "18822"))
-    workers = int(os.environ.get("AUDIT_MCP_WORKERS", "1"))
+    if workers is None:
+        workers = int(os.environ.get("AUDIT_MCP_WORKERS", "1"))
     if workers > 1:
         # Multi-worker: uvicorn requires a string import path + factory
         # flag so each worker process can re-import + call create_app.
