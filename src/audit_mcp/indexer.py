@@ -34,6 +34,8 @@ class IndexEntry:
     finished_at: float = 0.0
     engine: Any = None  # trailmark QueryEngine once status == "ready"
     gpu_engine: Any = None  # GpuGraphEngine (optional, built at index time)
+    semble_index: Any = None  # semble.SembleIndex (lazy-built on first use)
+    semble_lock: Any = None  # threading.Lock — initialized on first use
     summary: dict[str, Any] = field(default_factory=dict)
     preanalysis: dict[str, Any] = field(default_factory=dict)
 
@@ -305,3 +307,115 @@ class IndexManager:
             "max_loaded_engines": self._max_loaded,
             "eviction_count": self._eviction_count,
         }
+
+    # ------------------------------------------------------------------
+    # Semble integration — semantic + BM25 chunk retrieval
+    # ------------------------------------------------------------------
+    #
+    # semble is a CPU-only chunk-retrieval engine (static Model2Vec
+    # embeddings + BM25 + RRF + heuristic reranker). Built lazily per
+    # index on first ``get_semble_index`` call: indexing nginx takes
+    # ~250ms and even firefox-scale only ~13s, so blocking the first
+    # caller is cheaper than blocking every index-start with a long
+    # cold-build path.
+    #
+    # The semble index lives in RAM next to the trailmark engine. They
+    # share the same ``root_path``; semble chunks files with tree-sitter
+    # (its own parse, independent of trailmark's graph parse) so it can
+    # answer "give me chunks containing X" queries without touching the
+    # graph engine at all.
+
+    _SEMBLE_MODEL: Any = None  # singleton, loaded once per process
+
+    @classmethod
+    def _semble_model(cls) -> Any:
+        """Load and cache the potion-code-16M static embedding model.
+
+        Returns None when semble is not installed — get_semble_index
+        then returns None too and callers fall back to legacy paths.
+        """
+        if cls._SEMBLE_MODEL is not None:
+            return cls._SEMBLE_MODEL
+        try:
+            from model2vec import StaticModel
+        except ImportError:
+            return None
+        # Prefer a local-dir copy when present (avoids HF symlink-
+        # permission issues on Windows). Falls back to HF cache.
+        local_paths = [
+            os.environ.get("AUDIT_MCP_SEMBLE_MODEL_DIR", ""),
+            os.path.join(os.path.expanduser("~"), ".semble-models", "potion-code-16M"),
+        ]
+        for p in local_paths:
+            if p and os.path.isdir(p):
+                try:
+                    cls._SEMBLE_MODEL = StaticModel.from_pretrained(p)
+                    return cls._SEMBLE_MODEL
+                except (OSError, RuntimeError):
+                    continue
+        try:
+            cls._SEMBLE_MODEL = StaticModel.from_pretrained("minishlab/potion-code-16M")
+        except (OSError, RuntimeError) as exc:
+            _log.warning(
+                "semble model load failed: %s — semantic_search/find_related disabled",
+                exc,
+            )
+            return None
+        return cls._SEMBLE_MODEL
+
+    def get_semble_index(self, index_id: str) -> Any:
+        """Return the semble.SembleIndex for ``index_id``, building it
+        on first call. Returns None when semble isn't installed or the
+        index is unknown / not ready.
+
+        Per-entry double-checked locking: only one thread builds while
+        others wait, so a 13s firefox cold build doesn't fan out to 3
+        parallel builds when three branches all need it at once.
+        """
+        with self._lock:
+            entry = self._indexes.get(index_id)
+            if entry is None or entry.status != "ready":
+                return None
+            if entry.semble_index is not None:
+                return entry.semble_index
+            if entry.semble_lock is None:
+                entry.semble_lock = threading.Lock()
+            lock = entry.semble_lock
+            root_path = entry.root_path
+
+        with lock:
+            # Re-check inside lock — another thread may have built it.
+            with self._lock:
+                entry = self._indexes.get(index_id)
+                if entry is None:
+                    return None
+                if entry.semble_index is not None:
+                    return entry.semble_index
+
+            try:
+                from semble import SembleIndex
+            except ImportError:
+                _log.warning("semble not installed; semantic_search/find_related disabled")
+                return None
+
+            model = self._semble_model()
+            if model is None:
+                return None
+
+            t0 = time.time()
+            try:
+                sidx = SembleIndex.from_path(root_path, model=model)
+            except (OSError, ValueError, RuntimeError) as exc:
+                _log.warning("semble build failed for %s: %s", index_id, exc)
+                return None
+            elapsed = time.time() - t0
+            _log.info(
+                "semble index built for %s in %.1fs (root=%s)",
+                index_id, elapsed, root_path,
+            )
+
+            with self._lock:
+                entry = self._indexes.get(index_id)
+                if entry is not None:
+                    entry.semble_index = sidx
+            return sidx

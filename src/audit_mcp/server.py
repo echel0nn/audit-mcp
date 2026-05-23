@@ -1025,12 +1025,64 @@ def read_function(index_id: str, file_path: str, name: str) -> dict[str, Any]:
     function_name = name
     """Extract the full body of a function/method from a source file.
 
-    AST-only — uses the TypeResolver function index to land on the
-    exact definition (file + line). No regex grep, no call-site /
-    definition ambiguity. ``file_path`` is a disambiguation hint
-    when a name has multiple definitions across the tree; pass the
-    exact path from search_functions to pick a specific one.
+    Fast path (semble): query the semble chunk index for chunks
+    matching ``function_name`` inside ``file_path``. Returns instantly
+    (<5 ms) regardless of repo size — no per-call re-indexing.
+
+    Slow path (TypeResolver fallback): when semble is unavailable OR
+    the semble chunk doesn't contain the function (e.g. minified /
+    macro-defined / wrapper-defined functions), fall back to the
+    AST-only resolver. Previously this fallback was the ONLY path,
+    and on firefox-scale repos it re-indexed 250k files per call
+    (>15 min) — that's the bug investigation 417b469f tripped.
     """
+    # ── Fast path: semble chunk lookup ────────────────────────────
+    sidx = index_manager.get_semble_index(index_id)
+    if sidx is not None and function_name:
+        try:
+            hits = sidx.search(
+                function_name,
+                top_k=20,
+                filter_paths=[file_path] if file_path else None,
+            )
+        except (ValueError, RuntimeError):
+            hits = []
+        for r in hits:
+            c = r.chunk
+            content = c.content or ""
+            # Confirm the chunk actually defines/declares the requested
+            # function — avoids returning a chunk that just MENTIONS
+            # the name in a comment or call site. We check for common
+            # definition patterns rather than relying on tree-sitter
+            # node kind (semble doesn't expose it).
+            patterns = (
+                f"{function_name}(",         # most C/C++/JS/Py
+                f" {function_name} (",       # spaced
+                f"::{function_name}(",        # C++ method
+                f".{function_name}(",         # JS/Py method
+                f"def {function_name}(",      # Python def
+                f"function {function_name}(", # JS function
+                f"fn {function_name}(",       # Rust
+                f"func {function_name}(",     # Go
+            )
+            if any(p in content for p in patterns):
+                return {
+                    "file_path": c.file_path,
+                    "name": function_name,
+                    "line": c.start_line,
+                    "end_line": c.end_line,
+                    "language": c.language,
+                    "content": content,
+                    "source": "semble",
+                }
+
+    # ── Slow path: AST resolver ───────────────────────────────────
+    # Only reached when semble didn't find a confirming chunk. On
+    # huge functions (cyc > 500 / spans > 2000 lines) this can still
+    # take minutes — the caller (AILA bridge) should set a generous
+    # timeout, and we keep a single shared TypeResolver per index_id
+    # to avoid the per-call re-index regression that used to hang the
+    # whole server.
     from audit_mcp.type_resolver import TypeResolver
 
     searcher = _searcher(index_id)
@@ -1041,20 +1093,21 @@ def read_function(index_id: str, file_path: str, name: str) -> dict[str, Any]:
     if entry is None:
         return {"status": "error", "error": f"Index {index_id!r} has no root path"}
 
-    resolver = TypeResolver(entry.root_path)
-    resolver.index()
+    # Cache the resolver on the entry so we don't re-walk the tree
+    # 250k times for firefox. The slot is intentionally added at
+    # runtime (no dataclass field) so we don't break recovery paths.
+    resolver = getattr(entry, "_type_resolver", None)
+    if resolver is None:
+        resolver = TypeResolver(entry.root_path)
+        resolver.index()
+        entry._type_resolver = resolver  # noqa: SLF001
     candidates = resolver.type_table.lookup_function(function_name)
     if not candidates:
         return {
             "status": "error",
-            "error": f"Function {function_name!r} not indexed. Try search_functions to find the exact name.",
+            "error": f"Function {function_name!r} not indexed. Try search_functions or semantic_search.",
         }
 
-    # When multiple definitions exist (overloads, statics in different
-    # files), prefer the one whose file_path matches the supplied
-    # ``file_path`` hint. Otherwise return the first — TypeResolver
-    # emits in source-order so the canonical definition wins over
-    # forward declarations.
     chosen = None
     if file_path:
         needle = file_path.replace("\\", "/")
@@ -1076,6 +1129,7 @@ def read_function(index_id: str, file_path: str, name: str) -> dict[str, Any]:
             {"file_path": c.file_path, "line": c.line, "qualified_name": c.qualified_name}
             for c in candidates if c is not chosen
         ]
+    extracted["source"] = "type_resolver"
     return extracted
 
 
@@ -1201,6 +1255,139 @@ def fuzz_generators(
         return {"status": "error", "error": "No browser available"}
     result = fuzzer.fuzz(iterations=iterations, timeout_per_test=timeout_per_test)
     return result.to_dict()
+@mcp.tool()
+def semantic_search(
+    index_id: str,
+    query: str,
+    top_k: int = 10,
+    filter_languages: list[str] | None = None,
+    filter_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Natural-language / hybrid code search via semble (Model2Vec + BM25 + RRF).
+
+    Returns the top-k code chunks semantically + lexically matching the query.
+    Each chunk is a code-aware tree-sitter slice (function/class/block) — not a
+    file:line snippet — so the agent gets enough context in one shot to decide
+    whether to drill in.
+
+    Use this for "find code that does X" / "where is Y handled" queries where
+    regex (search_source) would require guessing the right keyword. Use
+    callers_of / taint_paths_to / read_function for graph-aware drill-in once
+    you have a candidate.
+
+    Cold first-call builds the semble index lazily (~250 ms for nginx, ~13 s
+    for firefox); subsequent calls are <5 ms.
+    """
+    sidx = index_manager.get_semble_index(index_id)
+    if sidx is None:
+        return {
+            "status": "error",
+            "error": (
+                f"semble index for {index_id!r} unavailable (install "
+                "`semble` + `model2vec` to enable, or check index is ready)"
+            ),
+        }
+    try:
+        results = sidx.search(
+            query,
+            top_k=top_k,
+            filter_languages=filter_languages,
+            filter_paths=filter_paths,
+        )
+    except (ValueError, RuntimeError) as exc:
+        return {"status": "error", "error": f"semble.search failed: {exc}"}
+    chunks = []
+    for r in results:
+        c = r.chunk
+        chunks.append({
+            "file_path": c.file_path,
+            "start_line": c.start_line,
+            "end_line": c.end_line,
+            "language": c.language,
+            "content": c.content,
+            "score": float(r.score),
+        })
+    return {
+        "status": "ready",
+        "query": query,
+        "results": chunks,
+        "count": len(chunks),
+    }
+
+
+@mcp.tool()
+def find_related(
+    index_id: str,
+    file_path: str,
+    line: int,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """Find code semantically similar to the chunk at (file_path, line).
+
+    Pass file_path + line from a prior search/read result. Returns the
+    top-k chunks whose embeddings are nearest to the source chunk —
+    useful for "show me other places that look like this" / pattern
+    expansion / variant hunting.
+    """
+    sidx = index_manager.get_semble_index(index_id)
+    if sidx is None:
+        return {
+            "status": "error",
+            "error": f"semble index for {index_id!r} unavailable",
+        }
+    # Locate a source chunk overlapping the requested (file, line).
+    # semble's search itself doubles as a chunk lookup when we filter
+    # by path; we then pick whichever chunk contains the requested line.
+    try:
+        candidates = sidx.search(
+            file_path,  # query = filename, biases retrieval to chunks in that file
+            top_k=50,
+            filter_paths=[file_path],
+        )
+    except (ValueError, RuntimeError) as exc:
+        return {"status": "error", "error": f"semble.search seed failed: {exc}"}
+    seed = None
+    for r in candidates:
+        c = r.chunk
+        if c.file_path.replace("\\", "/").endswith(file_path.replace("\\", "/")) and (
+            c.start_line <= line <= c.end_line
+        ):
+            seed = r
+            break
+    if seed is None and candidates:
+        seed = candidates[0]  # best file-match if no line-overlap
+    if seed is None:
+        return {
+            "status": "error",
+            "error": f"no chunk found at {file_path}:{line}",
+        }
+    try:
+        related = sidx.find_related(seed, top_k=top_k)
+    except (ValueError, RuntimeError) as exc:
+        return {"status": "error", "error": f"semble.find_related failed: {exc}"}
+    chunks = []
+    for r in related:
+        c = r.chunk
+        chunks.append({
+            "file_path": c.file_path,
+            "start_line": c.start_line,
+            "end_line": c.end_line,
+            "language": c.language,
+            "content": c.content,
+            "score": float(r.score),
+        })
+    return {
+        "status": "ready",
+        "seed": {
+            "file_path": seed.chunk.file_path,
+            "start_line": seed.chunk.start_line,
+            "end_line": seed.chunk.end_line,
+        },
+        "results": chunks,
+        "count": len(chunks),
+    }
+
+
 def run_mcp() -> None:
     """Run the MCP server over stdio."""
     mcp.run()
