@@ -31,10 +31,31 @@ _TOOL_EXCEPTIONS: tuple[type[BaseException], ...] = (
 
 
 def _tool_index() -> dict[str, Any]:
-    """Build a name->tool dict from FastMCP's local provider."""
-    import asyncio
+    """Build a name->tool dict from FastMCP's local provider.
 
-    tools = asyncio.run(mcp._local_provider.list_tools())
+    Loop-aware: in single-worker mode uvicorn loads the app BEFORE
+    starting its event loop, so ``asyncio.run`` works. In multi-worker
+    (factory=True) mode each spawned worker calls ``create_app`` from
+    INSIDE its event loop — ``asyncio.run`` raises
+    ``RuntimeError: cannot be called from a running event loop``.
+    Fall through to a worker thread in that case.
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+
+    if in_loop:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            tools = pool.submit(
+                lambda: asyncio.run(mcp._local_provider.list_tools()),
+            ).result()
+    else:
+        tools = asyncio.run(mcp._local_provider.list_tools())
     return {t.name: t for t in tools}
 
 def _make_handler(fn: Callable[..., Any], tool_name: str) -> Callable[..., Any]:
