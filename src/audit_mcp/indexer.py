@@ -472,12 +472,27 @@ class IndexManager:
         thread.start()
 
     def _semble_worker(self, index_id: str) -> None:
-        """Background-thread body: build (or load from pickle cache)
-        the semble index for ``index_id`` and store on the entry.
-        Persists pickled SembleIndex to ``~/.audit-mcp/semble-cache/``
-        on cold build for fast next-restart recovery.
+        """Background-thread body: get the semble index ready for
+        ``index_id`` and store it on the entry.
+
+        Three paths (in order):
+          1. Disk cache hit → load pickle inline (~9s for firefox).
+          2. Disk cache miss → spawn a SEPARATE Python process to do
+             the cold build. Parent's poller waits for child exit,
+             then loads the freshly-written pickle.
+          3. Hard failure → set semble_status = error.
+
+        The child-process path is the GIL-relief design. Cold semble
+        build on firefox-scale is ~85 min of pure-Python CPU work.
+        Running it in a thread inside this process holds the GIL
+        continuously, slowing every HTTP request. Spawning a subprocess
+        gives the build its own interpreter + GIL; the parent stays
+        responsive throughout, and pays only a brief GIL window when
+        loading the resulting pickle.
         """
         import pickle  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
         from pathlib import Path  # noqa: PLC0415
 
         with self._lock:
@@ -513,7 +528,7 @@ class IndexManager:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = cache_dir / f"{index_id}.pkl"
 
-        # Try disk cache first.
+        # ── Path 1: disk cache hit ─────────────────────────────────
         if cache_path.exists():
             t0 = time.time()
             try:
@@ -537,37 +552,93 @@ class IndexManager:
                     OSError, ImportError) as exc:
                 _log.warning("semble cache unreadable for %s (%s) — rebuilding", index_id, exc)
 
-        # Cold build.
-        t0 = time.time()
+        # ── Path 2: subprocess cold build ──────────────────────────
+        # Spawn a fresh Python interpreter. The child re-imports
+        # semble + model2vec on its own, does the build, pickles, and
+        # exits. Parent stays responsive because the child has its
+        # own GIL.
+        _log.info(
+            "semble cold build starting for %s in subprocess (root=%s)",
+            index_id, root_path,
+        )
+        build_t0 = time.time()
         try:
-            sidx = SembleIndex.from_path(root_path, model=model)
-        except (OSError, ValueError, RuntimeError) as exc:
-            err = f"{type(exc).__name__}: {exc}"
-            _log.warning("semble build failed for %s: %s", index_id, err)
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m", "audit_mcp._semble_build",
+                    root_path,
+                    str(cache_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                # Don't inherit parent's stdin; child needs no input.
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, FileNotFoundError) as exc:
+            err = f"failed to spawn _semble_build subprocess: {exc}"
+            _log.warning("semble subprocess spawn failed for %s: %s", index_id, err)
             _finish("error", error=err)
             return
-        elapsed = time.time() - t0
-        _log.info(
-            "semble index built for %s in %.1fs (root=%s)",
-            index_id, elapsed, root_path,
-        )
 
-        # Persist for next process.
+        # Wait for child to exit. communicate() blocks this thread but
+        # NOT the main audit_mcp event loop / HTTP handlers — they're
+        # in a different OS thread + the GIL is held by the child
+        # process, not us.
         try:
-            saved_model = sidx.model
-            sidx.model = None  # type: ignore[assignment]
-            with cache_path.open("wb") as f:
-                pickle.dump(sidx, f, protocol=pickle.HIGHEST_PROTOCOL)
-            sidx.model = saved_model
-            _log.info("semble cache written for %s -> %s", index_id, cache_path)
-        except (pickle.PicklingError, OSError, RecursionError) as exc:
-            _log.warning(
-                "semble cache write failed for %s: %s (continuing without cache)",
-                index_id, exc,
-            )
+            _stdout, stderr = proc.communicate(timeout=None)  # no parent-side cap
+        except Exception as exc:  # noqa: BLE001  (catch-all: subprocess can raise anything)
+            err = f"subprocess communicate raised: {type(exc).__name__}: {exc}"
+            _log.warning("semble subprocess error for %s: %s", index_id, err)
             try:
-                sidx.model = model
-            except AttributeError:
+                proc.kill()
+            except OSError:
                 pass
+            _finish("error", error=err)
+            return
 
-        _finish("ready", sidx=sidx)
+        build_elapsed = time.time() - build_t0
+        rc = proc.returncode
+        stderr_tail = (stderr or b"").decode("utf-8", errors="replace")[-1500:]
+
+        if rc != 0:
+            err = f"subprocess exit {rc}: {stderr_tail.strip()[-400:]}"
+            _log.warning("semble subprocess failed for %s (rc=%s): %s", index_id, rc, stderr_tail)
+            _finish("error", error=err)
+            return
+
+        _log.info(
+            "semble subprocess complete for %s in %.1fs; loading pickle into parent",
+            index_id, build_elapsed,
+        )
+        if stderr_tail.strip():
+            _log.info("semble subprocess stderr for %s:\n%s", index_id, stderr_tail.strip())
+
+        # ── Load freshly-written pickle into parent memory ─────────
+        if not cache_path.exists():
+            err = "subprocess exit 0 but no pickle written"
+            _log.warning("semble subprocess error for %s: %s", index_id, err)
+            _finish("error", error=err)
+            return
+
+        t0 = time.time()
+        try:
+            with cache_path.open("rb") as f:
+                loaded = pickle.load(f)
+            if not isinstance(loaded, SembleIndex):
+                err = f"unpickled object is {type(loaded).__name__}, not SembleIndex"
+                _finish("error", error=err)
+                return
+            loaded.model = model
+        except (pickle.UnpicklingError, AttributeError, EOFError,
+                OSError, ImportError) as exc:
+            err = f"pickle load after subprocess failed: {type(exc).__name__}: {exc}"
+            _log.warning("semble pickle load failed for %s: %s", index_id, err)
+            _finish("error", error=err)
+            return
+
+        _log.info(
+            "semble pickle loaded into parent for %s in %.1fs",
+            index_id, time.time() - t0,
+        )
+        _finish("ready", sidx=loaded)
