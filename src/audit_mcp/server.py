@@ -1447,10 +1447,16 @@ def semble_stats(index_id: str) -> dict[str, Any]:
             "status": "error",
             "error": f"semble index for {index_id!r} unavailable",
         }
+    # SembleIndex.stats is an ATTRIBUTE (an IndexStats dataclass
+    # instance), not a method. Older semble versions exposed it as a
+    # callable so we try attribute access first, fall through to call
+    # if the attribute happens to be callable (paranoid forward-compat).
     try:
-        s = sidx.stats()
-    except (AttributeError, RuntimeError) as exc:
-        return {"status": "error", "error": f"semble.stats() failed: {exc}"}
+        s = sidx.stats
+        if callable(s):
+            s = s()
+    except (AttributeError, TypeError, RuntimeError) as exc:
+        return {"status": "error", "error": f"semble stats lookup failed: {exc}"}
     # IndexStats dataclass → dict; field set varies by semble version
     # so we pull known attrs defensively and fall through to repr.
     out: dict[str, Any] = {"status": "ready"}
