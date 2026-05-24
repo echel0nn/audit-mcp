@@ -402,17 +402,89 @@ class IndexManager:
             if model is None:
                 return None
 
-            t0 = time.time()
-            try:
-                sidx = SembleIndex.from_path(root_path, model=model)
-            except (OSError, ValueError, RuntimeError) as exc:
-                _log.warning("semble build failed for %s: %s", index_id, exc)
-                return None
-            elapsed = time.time() - t0
-            _log.info(
-                "semble index built for %s in %.1fs (root=%s)",
-                index_id, elapsed, root_path,
-            )
+            # Persistence cache: semble has no save/load API but pickle
+            # works on the SembleIndex object. We cache to disk under
+            # ~/.audit-mcp/semble-cache/<index_id>.pkl so cold-restart
+            # cost is paid ONCE per index, not per process. Cache is
+            # keyed by index_id + root_path (root_path embedded in the
+            # pickled instance so a different repo at the same index_id
+            # — never happens but safety — won't load).
+            import pickle  # noqa: PLC0415
+            from pathlib import Path  # noqa: PLC0415
+
+            cache_dir = Path.home() / ".audit-mcp" / "semble-cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = cache_dir / f"{index_id}.pkl"
+
+            sidx = None
+            if cache_path.exists():
+                t0 = time.time()
+                try:
+                    with cache_path.open("rb") as f:
+                        loaded = pickle.load(f)
+                    # Validate: must be a SembleIndex with matching root.
+                    if (
+                        isinstance(loaded, SembleIndex)
+                        and getattr(loaded, "_root", None) is not None
+                        and str(loaded._root).replace("\\", "/").lower()
+                        == root_path.replace("\\", "/").lower()
+                    ):
+                        # Re-attach the live model (encoders may not
+                        # pickle cleanly across versions; safer to use
+                        # the singleton).
+                        loaded.model = model
+                        sidx = loaded
+                        _log.info(
+                            "semble index loaded for %s from cache in %.1fs",
+                            index_id, time.time() - t0,
+                        )
+                    else:
+                        _log.warning(
+                            "semble cache stale for %s (root mismatch) — rebuilding",
+                            index_id,
+                        )
+                except (pickle.UnpicklingError, AttributeError, EOFError,
+                        OSError, ImportError) as exc:
+                    _log.warning(
+                        "semble cache unreadable for %s (%s) — rebuilding",
+                        index_id, exc,
+                    )
+
+            if sidx is None:
+                t0 = time.time()
+                try:
+                    sidx = SembleIndex.from_path(root_path, model=model)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    _log.warning("semble build failed for %s: %s", index_id, exc)
+                    return None
+                elapsed = time.time() - t0
+                _log.info(
+                    "semble index built for %s in %.1fs (root=%s)",
+                    index_id, elapsed, root_path,
+                )
+                # Persist for next process: pickle the freshly-built
+                # index. Strip the model field first (don't re-pickle
+                # the singleton Encoder — it'll be re-attached on load).
+                try:
+                    saved_model = sidx.model
+                    sidx.model = None  # type: ignore[assignment]
+                    with cache_path.open("wb") as f:
+                        pickle.dump(sidx, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    sidx.model = saved_model
+                    _log.info(
+                        "semble cache written for %s -> %s",
+                        index_id, cache_path,
+                    )
+                except (pickle.PicklingError, OSError, RecursionError) as exc:
+                    _log.warning(
+                        "semble cache write failed for %s: %s "
+                        "(continuing without cache)",
+                        index_id, exc,
+                    )
+                    try:
+                        sidx.model = model
+                    except AttributeError:
+                        pass
 
             with self._lock:
                 entry = self._indexes.get(index_id)
