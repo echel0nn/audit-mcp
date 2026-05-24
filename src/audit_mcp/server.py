@@ -1293,11 +1293,38 @@ def semantic_search(
     """
     sidx = index_manager.get_semble_index(index_id)
     if sidx is None:
+        status_info = index_manager.semble_status_for(index_id)
+        s = status_info.get("status")
+        if s == "building":
+            elapsed = status_info.get("elapsed_s")
+            return {
+                "status": "pending",
+                "semble_status": "building",
+                "elapsed_s": elapsed,
+                "error": (
+                    f"semble index for {index_id!r} is still building "
+                    f"(started {elapsed:.0f}s ago). Poll poll_index "
+                    f"until semble_status='ready', then retry."
+                ) if elapsed else "semble index is still building. Poll poll_index until semble_status='ready'.",
+            }
+        if s == "error":
+            return {
+                "status": "error",
+                "semble_status": "error",
+                "error": f"semble build for {index_id!r} failed: {status_info.get('error')}",
+            }
+        if s == "disabled":
+            return {
+                "status": "error",
+                "semble_status": "disabled",
+                "error": f"semble disabled: {status_info.get('error')}",
+            }
         return {
             "status": "error",
+            "semble_status": s or "unknown",
             "error": (
-                f"semble index for {index_id!r} unavailable (install "
-                "`semble` + `model2vec` to enable, or check index is ready)"
+                f"semble index for {index_id!r} not available "
+                f"(status={s!r}). Ensure index is ready first."
             ),
         }
     try:

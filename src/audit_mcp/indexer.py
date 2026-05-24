@@ -34,8 +34,12 @@ class IndexEntry:
     finished_at: float = 0.0
     engine: Any = None  # trailmark QueryEngine once status == "ready"
     gpu_engine: Any = None  # GpuGraphEngine (optional, built at index time)
-    semble_index: Any = None  # semble.SembleIndex (lazy-built on first use)
-    semble_lock: Any = None  # threading.Lock — initialized on first use
+    semble_index: Any = None        # semble.SembleIndex (None until build completes)
+    semble_lock: Any = None         # threading.Lock — initialized on first use
+    semble_status: str = "pending"  # pending | building | ready | error | disabled
+    semble_error: str | None = None
+    semble_started_at: float = 0.0
+    semble_finished_at: float = 0.0
     summary: dict[str, Any] = field(default_factory=dict)
     preanalysis: dict[str, Any] = field(default_factory=dict)
 
@@ -107,6 +111,10 @@ class IndexManager:
                 "started_at": entry.started_at,
                 "finished_at": entry.finished_at,
                 "summary": dict(entry.summary),
+                "semble_status": entry.semble_status,
+                "semble_error": entry.semble_error,
+                "semble_started_at": entry.semble_started_at,
+                "semble_finished_at": entry.semble_finished_at,
             }
         result: dict[str, Any] = {
             "index_id": snapshot["index_id"],
@@ -121,6 +129,20 @@ class IndexManager:
         if snapshot["finished_at"] > 0:
             result["elapsed_seconds"] = round(
                 snapshot["finished_at"] - snapshot["started_at"], 2
+            )
+        # Surface semble build state — agent / operator polls poll_index
+        # to know when semantic_search + find_related + read_function
+        # fast-path become available.
+        result["semble_status"] = snapshot["semble_status"]
+        if snapshot["semble_error"]:
+            result["semble_error"] = snapshot["semble_error"]
+        if snapshot["semble_status"] == "building" and snapshot["semble_started_at"]:
+            result["semble_elapsed_seconds"] = round(
+                time.time() - snapshot["semble_started_at"], 1,
+            )
+        elif snapshot["semble_finished_at"] and snapshot["semble_started_at"]:
+            result["semble_elapsed_seconds"] = round(
+                snapshot["semble_finished_at"] - snapshot["semble_started_at"], 1,
             )
         return result
 
@@ -235,6 +257,16 @@ class IndexManager:
                 progress.failed_files,
                 gpu_info.get("backend", "?"),
             )
+
+            # Kick off semble build in the background — non-blocking.
+            # The main index is now "ready"; agents can call graph
+            # tools immediately. semble-backed tools (semantic_search,
+            # find_related, fast-path read_function) wait for the
+            # separate semble_status to become "ready". This is the
+            # right division: trailmark graph is small and fast to
+            # build (~30s firefox); semble has to chunk 250k files
+            # via tree-sitter (5-30 min firefox).
+            self._launch_semble_build(index_id)
         except (OSError, ValueError, RuntimeError, ImportError, MemoryError) as exc:
             _log.exception("index %s failed", index_id)
             with self._lock:
@@ -262,6 +294,13 @@ class IndexManager:
         recovered = sum(1 for e in self._indexes.values() if e.status == "ready")
         if recovered:
             _log.info("recovered %d ready indexes from durable store", recovered)
+            # Kick off semble build for each recovered index. Pickle
+            # cache makes warm-recovery fast (~1-3 s) so this is cheap
+            # even at startup. Cold-build only happens for indexes
+            # without a cached pkl.
+            for entry in list(self._indexes.values()):
+                if entry.status == "ready":
+                    self._launch_semble_build(entry.index_id)
 
     def close_index(self, index_id: str) -> bool:
         """Release in-memory engine, keep persistent data."""
@@ -364,130 +403,171 @@ class IndexManager:
         return cls._SEMBLE_MODEL
 
     def get_semble_index(self, index_id: str) -> Any:
-        """Return the semble.SembleIndex for ``index_id``, building it
-        on first call. Returns None when semble isn't installed or the
-        index is unknown / not ready.
+        """Return the cached semble.SembleIndex for ``index_id``, or
+        None if the background build hasn't completed yet.
 
-        Per-entry double-checked locking: only one thread builds while
-        others wait, so a 13s firefox cold build doesn't fan out to 3
-        parallel builds when three branches all need it at once.
+        Build is launched automatically when index_codebase finishes
+        (or at startup for recovered indexes). Callers should NOT
+        wait — they should check ``semble_status_for(index_id)`` and
+        either retry later or fall back to a non-semble code path.
+        Previously this method blocked inline for 5-30 min on cold
+        firefox; now it returns immediately.
         """
         with self._lock:
             entry = self._indexes.get(index_id)
-            if entry is None or entry.status != "ready":
+            if entry is None:
                 return None
-            if entry.semble_index is not None:
-                return entry.semble_index
-            if entry.semble_lock is None:
-                entry.semble_lock = threading.Lock()
-            lock = entry.semble_lock
+            return entry.semble_index  # None when not ready
+
+    def semble_status_for(self, index_id: str) -> dict[str, Any]:
+        """Return ``{status, started_at, finished_at, elapsed_s, error}``
+        for the semble build of ``index_id``. ``status`` is one of:
+        pending | building | ready | error | disabled.
+        """
+        with self._lock:
+            entry = self._indexes.get(index_id)
+        if entry is None:
+            return {"status": "unknown", "error": f"no such index {index_id!r}"}
+        now = time.time()
+        elapsed_s: float | None
+        if entry.semble_status == "building":
+            elapsed_s = now - entry.semble_started_at
+        elif entry.semble_finished_at:
+            elapsed_s = entry.semble_finished_at - entry.semble_started_at
+        else:
+            elapsed_s = None
+        return {
+            "status": entry.semble_status,
+            "started_at": entry.semble_started_at or None,
+            "finished_at": entry.semble_finished_at or None,
+            "elapsed_s": elapsed_s,
+            "error": entry.semble_error,
+        }
+
+    def _launch_semble_build(self, index_id: str) -> None:
+        """Spawn the background semble build thread for ``index_id``.
+
+        Idempotent: if status is already ``building`` or ``ready`` we
+        skip. If the disk cache exists, the build will just load it
+        (~1-3 s); otherwise it'll cold-build (5-30 min on firefox).
+        Errors are captured in ``semble_error`` and ``semble_status``
+        becomes ``error``; we never retry automatically.
+        """
+        with self._lock:
+            entry = self._indexes.get(index_id)
+            if entry is None:
+                return
+            if entry.semble_status in {"building", "ready"}:
+                return
+            entry.semble_status = "building"
+            entry.semble_error = None
+            entry.semble_started_at = time.time()
+
+        thread = threading.Thread(
+            target=self._semble_worker,
+            args=(index_id,),
+            name=f"semble-build-{index_id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _semble_worker(self, index_id: str) -> None:
+        """Background-thread body: build (or load from pickle cache)
+        the semble index for ``index_id`` and store on the entry.
+        Persists pickled SembleIndex to ``~/.audit-mcp/semble-cache/``
+        on cold build for fast next-restart recovery.
+        """
+        import pickle  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        with self._lock:
+            entry = self._indexes.get(index_id)
+            if entry is None:
+                return
             root_path = entry.root_path
 
-        with lock:
-            # Re-check inside lock — another thread may have built it.
+        def _finish(status: str, sidx: Any = None, error: str | None = None) -> None:
             with self._lock:
-                entry = self._indexes.get(index_id)
-                if entry is None:
-                    return None
-                if entry.semble_index is not None:
-                    return entry.semble_index
+                ent = self._indexes.get(index_id)
+                if ent is None:
+                    return
+                if sidx is not None:
+                    ent.semble_index = sidx
+                ent.semble_status = status
+                ent.semble_error = error
+                ent.semble_finished_at = time.time()
 
+        try:
+            from semble import SembleIndex
+        except ImportError:
+            _log.warning("semble not installed; semantic search disabled for %s", index_id)
+            _finish("disabled", error="semble not installed")
+            return
+
+        model = self._semble_model()
+        if model is None:
+            _finish("disabled", error="model load failed (potion-code-16M unavailable)")
+            return
+
+        cache_dir = Path.home() / ".audit-mcp" / "semble-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{index_id}.pkl"
+
+        # Try disk cache first.
+        if cache_path.exists():
+            t0 = time.time()
             try:
-                from semble import SembleIndex
-            except ImportError:
-                _log.warning("semble not installed; semantic_search/find_related disabled")
-                return None
-
-            model = self._semble_model()
-            if model is None:
-                return None
-
-            # Persistence cache: semble has no save/load API but pickle
-            # works on the SembleIndex object. We cache to disk under
-            # ~/.audit-mcp/semble-cache/<index_id>.pkl so cold-restart
-            # cost is paid ONCE per index, not per process. Cache is
-            # keyed by index_id + root_path (root_path embedded in the
-            # pickled instance so a different repo at the same index_id
-            # — never happens but safety — won't load).
-            import pickle  # noqa: PLC0415
-            from pathlib import Path  # noqa: PLC0415
-
-            cache_dir = Path.home() / ".audit-mcp" / "semble-cache"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_path = cache_dir / f"{index_id}.pkl"
-
-            sidx = None
-            if cache_path.exists():
-                t0 = time.time()
-                try:
-                    with cache_path.open("rb") as f:
-                        loaded = pickle.load(f)
-                    # Validate: must be a SembleIndex with matching root.
-                    if (
-                        isinstance(loaded, SembleIndex)
-                        and getattr(loaded, "_root", None) is not None
-                        and str(loaded._root).replace("\\", "/").lower()
-                        == root_path.replace("\\", "/").lower()
-                    ):
-                        # Re-attach the live model (encoders may not
-                        # pickle cleanly across versions; safer to use
-                        # the singleton).
-                        loaded.model = model
-                        sidx = loaded
-                        _log.info(
-                            "semble index loaded for %s from cache in %.1fs",
-                            index_id, time.time() - t0,
-                        )
-                    else:
-                        _log.warning(
-                            "semble cache stale for %s (root mismatch) — rebuilding",
-                            index_id,
-                        )
-                except (pickle.UnpicklingError, AttributeError, EOFError,
-                        OSError, ImportError) as exc:
-                    _log.warning(
-                        "semble cache unreadable for %s (%s) — rebuilding",
-                        index_id, exc,
-                    )
-
-            if sidx is None:
-                t0 = time.time()
-                try:
-                    sidx = SembleIndex.from_path(root_path, model=model)
-                except (OSError, ValueError, RuntimeError) as exc:
-                    _log.warning("semble build failed for %s: %s", index_id, exc)
-                    return None
-                elapsed = time.time() - t0
-                _log.info(
-                    "semble index built for %s in %.1fs (root=%s)",
-                    index_id, elapsed, root_path,
-                )
-                # Persist for next process: pickle the freshly-built
-                # index. Strip the model field first (don't re-pickle
-                # the singleton Encoder — it'll be re-attached on load).
-                try:
-                    saved_model = sidx.model
-                    sidx.model = None  # type: ignore[assignment]
-                    with cache_path.open("wb") as f:
-                        pickle.dump(sidx, f, protocol=pickle.HIGHEST_PROTOCOL)
-                    sidx.model = saved_model
+                with cache_path.open("rb") as f:
+                    loaded = pickle.load(f)
+                if (
+                    isinstance(loaded, SembleIndex)
+                    and getattr(loaded, "_root", None) is not None
+                    and str(loaded._root).replace("\\", "/").lower()
+                    == root_path.replace("\\", "/").lower()
+                ):
+                    loaded.model = model
                     _log.info(
-                        "semble cache written for %s -> %s",
-                        index_id, cache_path,
+                        "semble index loaded for %s from cache in %.1fs",
+                        index_id, time.time() - t0,
                     )
-                except (pickle.PicklingError, OSError, RecursionError) as exc:
-                    _log.warning(
-                        "semble cache write failed for %s: %s "
-                        "(continuing without cache)",
-                        index_id, exc,
-                    )
-                    try:
-                        sidx.model = model
-                    except AttributeError:
-                        pass
+                    _finish("ready", sidx=loaded)
+                    return
+                _log.warning("semble cache stale for %s (root mismatch) — rebuilding", index_id)
+            except (pickle.UnpicklingError, AttributeError, EOFError,
+                    OSError, ImportError) as exc:
+                _log.warning("semble cache unreadable for %s (%s) — rebuilding", index_id, exc)
 
-            with self._lock:
-                entry = self._indexes.get(index_id)
-                if entry is not None:
-                    entry.semble_index = sidx
-            return sidx
+        # Cold build.
+        t0 = time.time()
+        try:
+            sidx = SembleIndex.from_path(root_path, model=model)
+        except (OSError, ValueError, RuntimeError) as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            _log.warning("semble build failed for %s: %s", index_id, err)
+            _finish("error", error=err)
+            return
+        elapsed = time.time() - t0
+        _log.info(
+            "semble index built for %s in %.1fs (root=%s)",
+            index_id, elapsed, root_path,
+        )
+
+        # Persist for next process.
+        try:
+            saved_model = sidx.model
+            sidx.model = None  # type: ignore[assignment]
+            with cache_path.open("wb") as f:
+                pickle.dump(sidx, f, protocol=pickle.HIGHEST_PROTOCOL)
+            sidx.model = saved_model
+            _log.info("semble cache written for %s -> %s", index_id, cache_path)
+        except (pickle.PicklingError, OSError, RecursionError) as exc:
+            _log.warning(
+                "semble cache write failed for %s: %s (continuing without cache)",
+                index_id, exc,
+            )
+            try:
+                sidx.model = model
+            except AttributeError:
+                pass
+
+        _finish("ready", sidx=sidx)
