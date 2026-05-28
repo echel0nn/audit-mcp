@@ -581,12 +581,37 @@ class IndexManager:
             _finish("error", error=err)
             return
 
-        # Wait for child to exit. communicate() blocks this thread but
-        # NOT the main audit_mcp event loop / HTTP handlers — they're
-        # in a different OS thread + the GIL is held by the child
-        # process, not us.
+        # Wait for child to exit with a hard wall-clock cap. The
+        # parent's communicate() reads BOTH stdout and stderr to
+        # completion, which is the safe pattern (avoids the
+        # full-pipe-buffer deadlock that a naïve proc.wait() would
+        # suffer). We layer a generous timeout on top so a truly
+        # stuck child (semble parser pathological-input lockup, OOM
+        # killer race, tree-sitter wedge) does not hold the semble
+        # build state at "building" forever — a state that makes
+        # every semantic_search / find_related call for this index
+        # return "pending: building" indefinitely.
+        cold_build_timeout_s = int(
+            os.environ.get("AUDIT_MCP_SEMBLE_BUILD_TIMEOUT_S", str(2 * 60 * 60)),
+        )
         try:
-            _stdout, stderr = proc.communicate(timeout=None)  # no parent-side cap
+            _stdout, stderr = proc.communicate(timeout=cold_build_timeout_s)
+        except subprocess.TimeoutExpired:
+            err = (
+                f"semble subprocess exceeded {cold_build_timeout_s}s wall-clock "
+                f"timeout; killing child and marking semble build as failed. "
+                f"Re-run index_codebase to retry."
+            )
+            _log.warning("semble subprocess hung for %s: %s", index_id, err)
+            try:
+                proc.kill()
+                # drain any remaining buffered output so the child's pipes
+                # don't keep file descriptors alive after kill
+                proc.communicate(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            _finish("error", error=err)
+            return
         except Exception as exc:  # noqa: BLE001  (catch-all: subprocess can raise anything)
             err = f"subprocess communicate raised: {type(exc).__name__}: {exc}"
             _log.warning("semble subprocess error for %s: %s", index_id, err)
