@@ -143,6 +143,16 @@ class DurableIndexStore:
             self._write_state(index_id, record)
         return record
 
+
+    def update_root_path(self, index_id: str, new_root_path: str) -> None:
+        """Update the root_path for an existing index (clone dir moved)."""
+        with self._lock:
+            record = self._records.get(index_id)
+            if record is None:
+                return
+            record.root_path = new_root_path
+            self._write_state(index_id, record)
+
     def mark_ready(
         self,
         index_id: str,

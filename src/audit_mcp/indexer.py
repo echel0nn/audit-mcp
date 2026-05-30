@@ -280,11 +280,37 @@ class IndexManager:
         for record_dict in self._store.list_indexes():
             if record_dict.get("status") == "ready":
                 index_id = record_dict["index_id"]
+                root_path = record_dict.get("root_path", "")
+
+                # Fix stale root_path: clone may have moved between
+                # temp dir and ~/.cache/audit-mcp/clones/ across restarts.
+                # If stored path doesn't exist, scan current clone dir
+                # for a directory matching the repo slug.
+                if root_path and not Path(root_path).is_dir():
+                    from audit_mcp.server import _clone_dir  # noqa: PLC0415
+                    clone_root = _clone_dir()
+                    slug = Path(root_path).name  # e.g. "github.com_nginx_nginx@HEAD"
+                    candidate = clone_root / slug
+                    if candidate.is_dir():
+                        _log.warning(
+                            "index %s: root_path moved %s → %s, updating",
+                            index_id, root_path, str(candidate),
+                        )
+                        root_path = str(candidate)
+                        self._store.update_root_path(index_id, root_path)
+                    else:
+                        _log.warning(
+                            "index %s: root_path %s does not exist and no "
+                            "candidate found in %s, skipping recovery",
+                            index_id, root_path, clone_root,
+                        )
+                        continue
+
                 with self._lock:
                     if index_id not in self._indexes:
                         self._indexes[index_id] = IndexEntry(
                             index_id=index_id,
-                            root_path=record_dict.get("root_path", ""),
+                            root_path=root_path,
                             language=record_dict.get("language", "auto"),
                             status="ready",
                             started_at=record_dict.get("created_at", 0.0),
@@ -294,10 +320,6 @@ class IndexManager:
         recovered = sum(1 for e in self._indexes.values() if e.status == "ready")
         if recovered:
             _log.info("recovered %d ready indexes from durable store", recovered)
-            # Kick off semble build for each recovered index. Pickle
-            # cache makes warm-recovery fast (~1-3 s) so this is cheap
-            # even at startup. Cold-build only happens for indexes
-            # without a cached pkl.
             for entry in list(self._indexes.values()):
                 if entry.status == "ready":
                     self._launch_semble_build(entry.index_id)
