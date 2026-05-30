@@ -14,6 +14,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 __all__ = ["IndexManager", "IndexEntry"]
@@ -287,9 +288,9 @@ class IndexManager:
                 # If stored path doesn't exist, scan current clone dir
                 # for a directory matching the repo slug.
                 if root_path and not Path(root_path).is_dir():
-                    from audit_mcp.server import _clone_dir  # noqa: PLC0415
-                    clone_root = _clone_dir()
-                    slug = Path(root_path).name  # e.g. "github.com_nginx_nginx@HEAD"
+                    _clone_default = Path.home() / ".cache" / "audit-mcp" / "clones"
+                    clone_root = Path(os.environ.get("AUDIT_MCP_CLONE_DIR") or str(_clone_default))
+                    slug = Path(root_path).name
                     candidate = clone_root / slug
                     if candidate.is_dir():
                         _log.warning(
