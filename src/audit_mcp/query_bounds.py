@@ -209,6 +209,114 @@ def _safe_call(engine: Any, method_name: str, *args: Any) -> list[dict[str, Any]
         return []
 
 
+def _direct_neighbors_via_raw_edges(
+    engine: Any, name: str, direction: str,
+) -> list[dict[str, Any]]:
+    """Return direct callers/callees by walking the trailmark store's raw
+    edge list, bypassing the broken QueryEngine.callers_of / callees_of
+    semantics.
+
+    Root cause: trailmark's GraphStore.callers_of / callees_of look up
+    nodes via ``_digraph.successors`` / ``predecessors`` whose direction
+    is inverted on the C/C++ / Python / Go indexers we use — the raw
+    ``store._graph.edges`` list is correct (``source_id`` is the caller,
+    ``target_id`` is the callee), but the in-memory adjacency built
+    behind those query methods returns the opposite direction. Observed
+    live across nginx, Apache httpd, LiteLLM, ollama, Firefox.
+
+    Implementation walks the linear edge list once, filters by direction,
+    and returns CodeUnit-like dicts so the bounded_* callers see the same
+    shape they used to.
+    """
+    try:
+        graph = engine._store._graph
+    except AttributeError:
+        return []
+    nodes = getattr(graph, "nodes", None)
+    edges = getattr(graph, "edges", None)
+    if nodes is None or edges is None:
+        return []
+
+    # Resolve the queried name to one or more node ids. Trailmark ids are
+    # typically ``<module>:<name>`` so a plain name needs a suffix match.
+    target_ids: set[str] = set()
+    for nid, node in nodes.items():
+        if getattr(node, "name", "") == name:
+            target_ids.add(nid)
+            continue
+        # Suffix match for ``module:name`` ids when caller passed a
+        # qualified or bare name.
+        if nid == name or nid.endswith(":" + name) or nid.endswith("::" + name):
+            target_ids.add(nid)
+    if not target_ids:
+        return []
+
+    src_attr = "source_id"
+    tgt_attr = "target_id"
+    if direction == "callees":
+        # callees_of(N) → edges where source_id ∈ target_ids; return target nodes.
+        match_attr, other_attr = src_attr, tgt_attr
+    elif direction == "callers":
+        # callers_of(N) → edges where target_id ∈ target_ids; return source nodes.
+        match_attr, other_attr = tgt_attr, src_attr
+    else:
+        return []
+
+    found_ids: list[str] = []
+    seen: set[str] = set()
+    for edge in edges:
+        kind_val = getattr(edge.kind, "value", str(edge.kind))
+        if kind_val != "calls":
+            continue
+        if getattr(edge, match_attr, "") not in target_ids:
+            continue
+        other_id = getattr(edge, other_attr, "")
+        if not other_id or other_id in seen or other_id in target_ids:
+            continue
+        seen.add(other_id)
+        found_ids.append(other_id)
+
+    def _node_to_dict(nid: str) -> dict[str, Any]:
+        node = nodes.get(nid)
+        if node is None:
+            short = nid.rsplit(":", 1)[-1] if ":" in nid else nid
+            return {
+                "id": nid,
+                "name": short,
+                "kind": "function",
+                "location": {"file_path": "", "start_line": 0, "end_line": 0,
+                             "start_col": 0, "end_col": 0},
+                "parameters": [],
+                "return_type": None,
+                "exception_types": [],
+                "cyclomatic_complexity": None,
+                "branches": [],
+                "docstring": None,
+            }
+        loc = getattr(node, "location", None)
+        kind_val = getattr(node.kind, "value", str(node.kind))
+        return {
+            "id": nid,
+            "name": getattr(node, "name", nid),
+            "kind": kind_val,
+            "location": {
+                "file_path": getattr(loc, "file_path", "") if loc else "",
+                "start_line": getattr(loc, "start_line", 0) if loc else 0,
+                "end_line": getattr(loc, "end_line", 0) if loc else 0,
+                "start_col": getattr(loc, "start_col", 0) if loc else 0,
+                "end_col": getattr(loc, "end_col", 0) if loc else 0,
+            },
+            "parameters": list(getattr(node, "parameters", []) or []),
+            "return_type": getattr(node, "return_type", None),
+            "exception_types": list(getattr(node, "exception_types", []) or []),
+            "cyclomatic_complexity": getattr(node, "cyclomatic_complexity", None),
+            "branches": list(getattr(node, "branches", []) or []),
+            "docstring": getattr(node, "docstring", None),
+        }
+
+    return [_node_to_dict(nid) for nid in found_ids]
+
+
 def bounded_callers(engine: Any, name: str, bounds: QueryBounds, gpu_engine: Any = None) -> BoundedResult:
     """Direct callers of *name*, with hub filtering and paging."""
     bounds = clamp_bounds(bounds)
@@ -216,7 +324,7 @@ def bounded_callers(engine: Any, name: str, bounds: QueryBounds, gpu_engine: Any
     if gpu_engine is not None:
         callers = gpu_engine.callers_of(name)
     else:
-        callers = _safe_call(engine, "callers_of", name)
+        callers = _direct_neighbors_via_raw_edges(engine, name, "callers")
     return _filter_and_page(callers, bounds, hubs)
 
 
@@ -227,7 +335,7 @@ def bounded_callees(engine: Any, name: str, bounds: QueryBounds, gpu_engine: Any
     if gpu_engine is not None:
         callees = gpu_engine.callees_of(name)
     else:
-        callees = _safe_call(engine, "callees_of", name)
+        callees = _direct_neighbors_via_raw_edges(engine, name, "callees")
     return _filter_and_page(callees, bounds, hubs)
 
 
