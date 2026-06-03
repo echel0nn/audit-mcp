@@ -186,17 +186,16 @@ class GpuGraphEngine:
             return visited.astype(bool)
 
     def callees_of(self, name: str) -> list[dict[str, Any]]:
-        """Direct callees (depth=1 forward BFS)."""
-        idx = self._resolve(name)
-        if idx is None:
-            return []
-        adj = self._adj_gpu if self._gpu else self._adj_cpu
-        visited = self._spmv_bfs(idx, adj, max_depth=1)
-        visited[idx] = False  # exclude self
-        return self._idx_to_dicts(visited)
+        """Direct callees (depth=1 forward BFS).
 
-    def callers_of(self, name: str) -> list[dict[str, Any]]:
-        """Direct callers (depth=1 backward BFS on transposed adj)."""
+        Implementation: ``A @ v`` returns predecessors-of-v (rows where
+        the matrix has a 1 in any column that v has set). The CSR was
+        built with ``rows=src, cols=tgt`` so ``A.T @ v`` gives the true
+        forward step (nodes v points TO = nodes v calls). Without the
+        transpose, callees_of historically returned callers and vice
+        versa across every indexed codebase (nginx, httpd, ollama,
+        firefox, litellm verified).
+        """
         idx = self._resolve(name)
         if idx is None:
             return []
@@ -205,23 +204,37 @@ class GpuGraphEngine:
         visited[idx] = False
         return self._idx_to_dicts(visited)
 
-    def reachable_from(self, name: str, max_depth: int = 20) -> list[dict[str, Any]]:
-        """All transitively reachable callees."""
+    def callers_of(self, name: str) -> list[dict[str, Any]]:
+        """Direct callers (depth=1 backward BFS).
+
+        Uses the original (non-transposed) adjacency: ``A @ v`` gives
+        predecessors of v, which are callers when edges are stored as
+        caller→callee."""
         idx = self._resolve(name)
         if idx is None:
             return []
         adj = self._adj_gpu if self._gpu else self._adj_cpu
-        visited = self._spmv_bfs(idx, adj, max_depth)
+        visited = self._spmv_bfs(idx, adj, max_depth=1)
         visited[idx] = False
         return self._idx_to_dicts(visited)
 
-    def ancestors_of(self, name: str, max_depth: int = 20) -> list[dict[str, Any]]:
-        """All transitive callers."""
+    def reachable_from(self, name: str, max_depth: int = 20) -> list[dict[str, Any]]:
+        """All transitively reachable callees (forward direction)."""
         idx = self._resolve(name)
         if idx is None:
             return []
         adj_t = self._adj_t_gpu if self._gpu else self._adj_t_cpu
         visited = self._spmv_bfs(idx, adj_t, max_depth)
+        visited[idx] = False
+        return self._idx_to_dicts(visited)
+
+    def ancestors_of(self, name: str, max_depth: int = 20) -> list[dict[str, Any]]:
+        """All transitive callers (backward direction)."""
+        idx = self._resolve(name)
+        if idx is None:
+            return []
+        adj = self._adj_gpu if self._gpu else self._adj_cpu
+        visited = self._spmv_bfs(idx, adj, max_depth)
         visited[idx] = False
         return self._idx_to_dicts(visited)
 
