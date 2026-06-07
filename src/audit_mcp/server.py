@@ -196,6 +196,98 @@ def clone_repo(repo_url: str, ref: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
+def refresh_index(index_id: str, force: bool = False) -> dict[str, Any]:
+    """Pull the latest upstream git for an index and rebuild it if needed.
+
+    Workflow:
+
+    1. Resolve the index's ``root_path`` from the in-memory registry. If
+       the index does not exist, returns ``{"status": "error", "error":
+       "unknown index_id"}``.
+    2. Run ``git fetch --depth=1 origin HEAD && git reset --hard
+       FETCH_HEAD`` in ``root_path`` so the working tree points at the
+       upstream tip.
+    3. Read the new HEAD SHA via ``git rev-parse HEAD`` and compare with
+       the SHA last persisted by a prior refresh
+       (``<workspace>/last_indexed.sha``).
+    4. If the SHA is unchanged and ``force=False``: no-op. Return
+       ``{"status": "current", ...}``.
+    5. If the SHA changed (or ``force=True``): call ``IndexManager.drop``
+       to evict the in-memory entry + delete the on-disk workspace, then
+       call ``start_index`` to begin a fresh build. The new SHA is
+       written to the workspace once the build transitions to READY (see
+       ``_index_worker``).
+
+    The parse-cache (under ``AUDIT_MCP_PARSE_CACHE_DIR``) is preserved so
+    unchanged files re-use cached parse results; only files whose content
+    actually changed get re-parsed.
+
+    Returns one of:
+
+    - ``{"status": "current", "index_id": ..., "sha": ...}``
+    - ``{"status": "refreshing", "index_id": ..., "old_sha": ..., "new_sha": ...}``
+    - ``{"status": "error", "error": ...}``
+    """
+    import subprocess
+
+    snapshot = index_manager.poll(index_id)
+    if snapshot.get("status") == "error":
+        return {"status": "error", "error": snapshot.get("error", "unknown index")}
+    root_path = snapshot.get("root_path")
+    language = snapshot.get("language", "auto")
+    if not root_path:
+        return {"status": "error", "error": "index has no root_path"}
+    root = Path(root_path)
+    if not (root / ".git").exists():
+        return {
+            "status": "error",
+            "error": f"root_path {root_path} is not a git checkout",
+        }
+
+    try:
+        subprocess.run(  # noqa: S603
+            ["git", "-C", str(root), "fetch", "--depth", "1", "origin", "HEAD"],
+            capture_output=True, check=True, timeout=_CLONE_TIMEOUT_SECONDS,
+        )
+        subprocess.run(  # noqa: S603
+            ["git", "-C", str(root), "reset", "--hard", "FETCH_HEAD"],
+            capture_output=True, check=True, timeout=_CLONE_TIMEOUT_SECONDS,
+        )
+        new_sha = subprocess.run(  # noqa: S603
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, check=True, timeout=30, text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        err = (exc.stderr or b"").decode(errors="replace").strip()[:400]
+        return {"status": "error", "error": f"git failed (exit {exc.returncode}): {err}"}
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": f"git timed out after {_CLONE_TIMEOUT_SECONDS}s"}
+
+    old_sha = index_manager._store.read_last_indexed_sha(index_id)
+
+    if old_sha == new_sha and not force:
+        return {
+            "status": "current",
+            "index_id": index_id,
+            "sha": new_sha,
+            "root_path": str(root),
+        }
+
+    index_manager.drop(index_id)
+    new_id = index_manager.start_index(str(root), language=language)
+    index_manager._store.write_last_indexed_sha(new_id, new_sha)
+
+    return {
+        "status": "refreshing",
+        "index_id": new_id,
+        "old_sha": old_sha,
+        "new_sha": new_sha,
+        "root_path": str(root),
+        "forced": force,
+    }
+
+
+@mcp.tool()
 def index_codebase(path: str, language: str = "auto") -> dict[str, Any]:
     """Begin indexing a codebase. Returns immediately with an index_id.
 

@@ -248,6 +248,54 @@ class DurableIndexStore:
                 return True
         return False
 
+    def drop(self, index_id: str) -> bool:
+        """Forget an index entirely — drop the in-memory record, evict the
+        cached engine, and remove the on-disk workspace.
+
+        Returns True when something was removed, False when the index was
+        not known. Idempotent: calling twice is safe.
+
+        Use case: forced refresh. After dropping, a subsequent
+        ``register`` + ``mark_ready`` cycle treats the index as brand new.
+        """
+        import shutil
+
+        with self._lock:
+            had_record = self._records.pop(index_id, None) is not None
+            self._engines.pop(index_id, None)
+
+        ws = self.workspace(index_id)
+        had_workspace = ws.exists()
+        if had_workspace:
+            try:
+                shutil.rmtree(ws, ignore_errors=False)
+            except OSError as exc:
+                _log.warning("Failed to remove workspace %s: %s", ws, exc)
+
+        return had_record or had_workspace
+
+    def read_last_indexed_sha(self, index_id: str) -> str | None:
+        """Return the git SHA last written to ``<workspace>/last_indexed.sha``
+        when the index entered READY. Returns None when missing.
+        """
+        ws = self.workspace(index_id)
+        sha_file = ws / "last_indexed.sha"
+        if not sha_file.exists():
+            return None
+        try:
+            return sha_file.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+
+    def write_last_indexed_sha(self, index_id: str, sha: str) -> None:
+        """Persist the upstream git SHA the index was built from."""
+        ws = self.workspace(index_id)
+        ws.mkdir(parents=True, exist_ok=True)
+        try:
+            (ws / "last_indexed.sha").write_text(sha.strip(), encoding="utf-8")
+        except OSError as exc:
+            _log.warning("Failed to write last_indexed.sha for %s: %s", index_id, exc)
+
     def write_heartbeat(self, index_id: str) -> None:
         """Write a heartbeat file for the indexing worker."""
         ws = self.workspace(index_id)

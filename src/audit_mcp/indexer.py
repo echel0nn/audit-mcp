@@ -214,6 +214,19 @@ class IndexManager:
             ids = list(self._indexes.keys())
         return [self.poll(i) for i in ids]
 
+    def drop(self, index_id: str) -> bool:
+        """Drop an index entirely — in-memory entry + durable workspace.
+
+        Returns True when something was removed. Used by the refresh
+        workflow before re-running ``start_index`` so the idempotency
+        short-circuit (status == 'ready'/'indexing') doesn't fire.
+        """
+        with self._lock:
+            entry = self._indexes.pop(index_id, None)
+            self._access_order.pop(index_id, None)
+        store_drop = self._store.drop(index_id)
+        return entry is not None or store_drop
+
     def _index_worker(self, index_id: str) -> None:
         with self._lock:
             entry = self._indexes.get(index_id)
